@@ -1,0 +1,20 @@
+# Compiled releases and historical binaries
+*.exe
+*.exe.bak
+*.zip
+
+# Generated screenshots, videos and temporary build files
+*.png
+*.mp4
+work/
+tutorial-video/
+
+# Local configuration and package dependencies
+update-url.txt
+node_modules/
+.wrangler/
+.dev.vars
+
+# Keep source icons tracked
+!outputs/SkuBatchUiPrototype/sku-source.ico
+!outputs/SkuBatchUiShareNoNameRecord/sku-source.ico

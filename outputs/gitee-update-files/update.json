@@ -1,0 +1,5 @@
+{
+  "version": "1.0.18",
+  "url": "https://gitee.com/marting23/sku-tool-update/raw/master/latest-share.exe",
+  "notes": "更新内容：新增批量图片加SKU功能，可给单张或多张图片自动增加所在文件夹的SKU前缀。"
+}

@@ -1,0 +1,2851 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Effects;
+using System.Windows.Media.Imaging;
+using System.Windows.Shell;
+using Forms = System.Windows.Forms;
+using Application = System.Windows.Application;
+using Button = System.Windows.Controls.Button;
+using CheckBox = System.Windows.Controls.CheckBox;
+using ComboBox = System.Windows.Controls.ComboBox;
+using MessageBox = System.Windows.MessageBox;
+using Orientation = System.Windows.Controls.Orientation;
+using Path = System.IO.Path;
+using TextBox = System.Windows.Controls.TextBox;
+
+internal static class Program
+{
+    private const string SingleInstanceMutexName = @"Global\ChenXinrongSkuBatchRenameTool";
+    internal const string ShowExistingEventName = @"Global\ChenXinrongSkuBatchRenameToolShow";
+    private static Mutex singleInstanceMutex;
+
+    [STAThread]
+    private static void Main()
+    {
+        bool createdNew;
+        singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out createdNew);
+        if (!createdNew)
+        {
+            try
+            {
+                using (var showEvent = EventWaitHandle.OpenExisting(ShowExistingEventName))
+                {
+                    showEvent.Set();
+                }
+            }
+            catch
+            {
+            }
+            singleInstanceMutex.Dispose();
+            return;
+        }
+
+        try
+        {
+            var app = new Application();
+            app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            app.Run(new MainWindow());
+        }
+        catch (Exception ex)
+        {
+            File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.log"), ex.ToString());
+            MessageBox.Show(ex.ToString(), "启动失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            singleInstanceMutex.ReleaseMutex();
+            singleInstanceMutex.Dispose();
+        }
+    }
+}
+
+internal sealed class MainWindow : Window
+{
+    private const double WindowW = 1120;
+    private const double WindowH = 780;
+    private const string AppFontFamily = "PingFang SC, Microsoft YaHei UI";
+    private const string NoFolderOption = "无";
+    private const string MotherOption = "之前的母体不计数";
+    private const string ColorRetouchOption = "颜色变体-调色";
+    private const string QuantityFirstImageOption = "数量变体改首图";
+    private const string CurrentVersion = "1.1.0";
+    private const string DefaultUpdateManifestUrl = "https://gitee.com/marting23/sku-tool-update/raw/master/update-personal.json";
+    private const string HistoryFileName = ".sku_rename_history";
+    private const string LegacyHistoryFileName = ".sku_rename_history.tsv";
+    private static readonly string HistoryStoreRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ChenXinrongSkuBatchRenameTool",
+        "history");
+    private readonly string nameStorePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ChenXinrongSkuBatchRenameTool",
+        "names.txt");
+    private static readonly HashSet<string> ImageExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".heif", ".avif"
+    };
+    private readonly StackPanel listPanel;
+    private readonly List<string> selectedImagePaths = new List<string>();
+    private StackPanel imageListPanel;
+    private Border imageDropFrame;
+    private Border imagePageFrame;
+    private Border sidebarFrame;
+    private Grid folderWorkspace;
+    private Grid imageWorkspace;
+    private Button folderNavButton;
+    private Button imageNavButton;
+    private TextBlock imageCountLabel;
+    private bool imageMode;
+    private TextBlock folderCountText;
+    private TextBlock doneCountText;
+    private TextBlock selectedCountText;
+    private ToggleButton themeToggle;
+    private CheckBox overwriteCheck;
+    private ComboBox nameCombo;
+    private Button saveNameButton;
+    private TextBlock nameLabelText;
+    private Border shell;
+    private Border listFrame;
+    private ImageSource appIconSource;
+    private TextBlock titleText;
+    private Button changeLogButton;
+    private Button checkUpdateButton;
+    private Popup changeLogPopup;
+    private readonly List<TextBlock> headerTexts = new List<TextBlock>();
+    private readonly List<TextBlock> toolbarTexts = new List<TextBlock>();
+    private Border iconWrap;
+    internal static bool CurrentDarkMode;
+    private readonly EventWaitHandle showExistingEvent;
+    private readonly Thread showExistingThread;
+    private bool isClosing;
+    private readonly List<SkuFolderRow> rows = new List<SkuFolderRow>();
+    private readonly Forms.NotifyIcon trayIcon;
+    private bool darkMode;
+    private bool allowExit;
+
+    public MainWindow()
+    {
+        Title = "批量修改文件夹SKU和图片SKU后缀";
+        Width = WindowW;
+        Height = WindowH;
+        MinWidth = WindowW;
+        MinHeight = WindowH;
+        MaxWidth = WindowW;
+        MaxHeight = WindowH;
+        ResizeMode = ResizeMode.NoResize;
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        WindowStyle = WindowStyle.None;
+        AllowsTransparency = true;
+        Background = Brushes.Transparent;
+        FontFamily = new FontFamily(AppFontFamily);
+        UseLayoutRounding = true;
+        SnapsToDevicePixels = true;
+        TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
+        TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+        AllowDrop = true;
+
+        var icon = LoadIcon();
+        if (icon != null)
+        {
+            appIconSource = Imaging.CreateBitmapSourceFromHIcon(icon.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+            Icon = appIconSource;
+        }
+
+        WindowChrome.SetWindowChrome(this, new WindowChrome
+        {
+            CaptionHeight = 0,
+            CornerRadius = new CornerRadius(36),
+            GlassFrameThickness = new Thickness(0),
+            ResizeBorderThickness = new Thickness(0),
+            UseAeroCaptionButtons = false
+        });
+
+        shell = new Border
+        {
+            Width = WindowW - 22,
+            Height = WindowH - 22,
+            Margin = new Thickness(11),
+            CornerRadius = new CornerRadius(20),
+            Background = Brush("#ECECEC"),
+            Effect = Shadow(24, 0, 0.14)
+        };
+        Content = shell;
+
+        var appLayout = new Grid { Margin = new Thickness(11) };
+        appLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(205) });
+        appLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        shell.Child = appLayout;
+        sidebarFrame = (Border)BuildSidebar();
+        appLayout.Children.Add(sidebarFrame);
+
+        var root = new Grid { Margin = new Thickness(28, 25, 28, 22) };
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(58) });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        Grid.SetColumn(root, 1);
+        appLayout.Children.Add(root);
+
+        root.Children.Add(BuildHeader());
+
+        folderWorkspace = new Grid();
+        folderWorkspace.RowDefinitions.Add(new RowDefinition { Height = new GridLength(58) });
+        folderWorkspace.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        folderWorkspace.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        Grid.SetRow(folderWorkspace, 1);
+        Grid.SetRowSpan(folderWorkspace, 3);
+        root.Children.Add(folderWorkspace);
+        var toolbar = BuildToolbar();
+        Grid.SetRow(toolbar, 0);
+        folderWorkspace.Children.Add(toolbar);
+
+        listFrame = new Border
+        {
+            Background = Brushes.White,
+            CornerRadius = new CornerRadius(18),
+            BorderBrush = Brush("#F2F2F2"),
+            BorderThickness = new Thickness(1),
+            Effect = Shadow(18, 5, 0.06)
+        };
+        Grid.SetRow(listFrame, 1);
+        folderWorkspace.Children.Add(listFrame);
+
+        var listGrid = new Grid { Margin = new Thickness(24, 22, 24, 20) };
+        listGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        listGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        listFrame.Child = listGrid;
+        listGrid.Children.Add(BuildListHeader());
+
+        var scroll = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Margin = new Thickness(0, 16, 0, 0)
+        };
+        Grid.SetRow(scroll, 1);
+        listGrid.Children.Add(scroll);
+
+        listPanel = new StackPanel();
+        scroll.Content = listPanel;
+        AddEmptyState();
+
+        var footer = BuildFooter();
+        Grid.SetRow(footer, 2);
+        folderWorkspace.Children.Add(footer);
+
+        imageWorkspace = BuildImageWorkspace();
+        imageWorkspace.Visibility = Visibility.Collapsed;
+        Grid.SetRow(imageWorkspace, 1);
+        Grid.SetRowSpan(imageWorkspace, 3);
+        root.Children.Add(imageWorkspace);
+        SetWorkspace(false);
+
+        DragEnter += OnDragEnter;
+        DragLeave += OnDragLeave;
+        Drop += OnDrop;
+        MouseLeftButtonDown += (s, e) =>
+        {
+            if (e.ButtonState == MouseButtonState.Pressed && !IsInteractive(e.OriginalSource as DependencyObject))
+            {
+                try { DragMove(); } catch { }
+            }
+        };
+        Closing += (s, e) =>
+        {
+            if (allowExit)
+            {
+                isClosing = true;
+                foreach (var row in rows) row.Dispose();
+                if (showExistingEvent != null) showExistingEvent.Set();
+                trayIcon.Visible = false;
+                trayIcon.Dispose();
+                if (showExistingEvent != null) showExistingEvent.Dispose();
+                return;
+            }
+            e.Cancel = true;
+            Hide();
+            trayIcon.ShowBalloonTip(1200, "工具已最小化", "双击右下角图标可重新打开。", Forms.ToolTipIcon.Info);
+        };
+
+        trayIcon = new Forms.NotifyIcon
+        {
+            Icon = icon ?? System.Drawing.SystemIcons.Application,
+            Visible = true,
+            Text = "批量修改文件夹SKU和图片SKU后缀"
+        };
+        var menu = new Forms.ContextMenu();
+        var showItem = new Forms.MenuItem("显示窗口");
+        var exitItem = new Forms.MenuItem("退出工具");
+        menu.MenuItems.Add(showItem);
+        menu.MenuItems.Add(exitItem);
+        trayIcon.ContextMenu = menu;
+        trayIcon.DoubleClick += (s, e) => ShowFromTray();
+        showItem.Click += (s, e) => ShowFromTray();
+        exitItem.Click += (s, e) =>
+        {
+            allowExit = true;
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            Close();
+            Application.Current.Shutdown();
+        };
+        var updateItem = new Forms.MenuItem("检查更新");
+        menu.MenuItems.Add("-");
+        menu.MenuItems.Add(updateItem);
+        updateItem.Click += (s, e) => Dispatcher.BeginInvoke(new Action(() => CheckForUpdates(false)));
+
+        bool createdShowEvent;
+        showExistingEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowExistingEventName, out createdShowEvent);
+        showExistingThread = new Thread(WaitForShowExistingSignal);
+        showExistingThread.IsBackground = true;
+        showExistingThread.Start();
+        Dispatcher.BeginInvoke(new Action(() => CheckForUpdates(true)), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+    }
+
+    private UIElement BuildHeader()
+    {
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(98) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var iconStack = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top
+        };
+        iconWrap = new Border
+        {
+            Width = 58,
+            Height = 58,
+            CornerRadius = new CornerRadius(18),
+            Background = Brushes.White,
+            Effect = Shadow(15, 3, 0.06),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top
+        };
+        if (appIconSource != null)
+        {
+            iconWrap.Child = new Image
+            {
+                Source = appIconSource,
+                Width = 40,
+                Height = 40,
+                Stretch = Stretch.Uniform,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+        iconStack.Children.Add(iconWrap);
+        header.Children.Add(iconStack);
+
+        var titleRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(0, 14, 0, 0)
+        };
+        titleText = Text("批量改文件夹", 22, "#111111", FontWeights.Bold);
+        titleText.VerticalAlignment = VerticalAlignment.Center;
+        titleRow.Children.Add(titleText);
+        checkUpdateButton = HeaderActionButton("检查更新");
+        checkUpdateButton.Margin = new Thickness(50, 3, 0, 0);
+        checkUpdateButton.Click += (s, e) => CheckForUpdates(false);
+        titleRow.Children.Add(checkUpdateButton);
+        changeLogButton = HeaderActionButton("优化记录");
+        changeLogButton.Margin = new Thickness(18, 3, 0, 0);
+        changeLogButton.Click += (s, e) => ToggleChangeLogPopup();
+        titleRow.Children.Add(changeLogButton);
+        Grid.SetColumn(titleRow, 1);
+        header.Children.Add(titleRow);
+
+        var right = new StackPanel { Orientation = Orientation.Vertical, HorizontalAlignment = HorizontalAlignment.Right };
+        Grid.SetColumn(right, 2);
+        header.Children.Add(right);
+
+        var windowButtons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        var minButton = CircleButton("−", 28);
+        var closeButton = CircleButton("×", 28);
+        windowButtons.Children.Add(minButton);
+        windowButtons.Children.Add(Spacer(8, 1));
+        windowButtons.Children.Add(closeButton);
+        right.Children.Add(windowButtons);
+
+        themeToggle = new ToggleButton
+        {
+            Content = "切换深色主题",
+            Width = 120,
+            Height = 30,
+            Margin = new Thickness(0, 14, 0, 0),
+            Background = Brushes.White,
+            Foreground = Brush("#171717"),
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            BorderThickness = new Thickness(0),
+            Cursor = Cursors.Hand,
+            Template = RoundedToggleTemplate(15)
+        };
+        right.Children.Add(themeToggle);
+
+        minButton.Click += (s, e) => WindowState = WindowState.Minimized;
+        closeButton.Click += (s, e) => Hide();
+        themeToggle.Checked += (s, e) => SetDarkMode(true);
+        themeToggle.Unchecked += (s, e) => SetDarkMode(false);
+        return header;
+    }
+
+    private UIElement BuildSidebar()
+    {
+        var sidebar = new Border
+        {
+            Background = Brushes.White,
+            BorderBrush = Brush("#E8E9ED"),
+            BorderThickness = new Thickness(0, 0, 1, 0),
+            Padding = new Thickness(16, 18, 14, 16)
+        };
+        var layout = new Grid();
+        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        sidebar.Child = layout;
+
+        var brand = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 0, 28) };
+        var brandIcon = new Border { Width = 34, Height = 34, CornerRadius = new CornerRadius(10), Background = darkMode ? Brush("#262B36") : Brush("#F4F5F7") };
+        if (appIconSource != null) brandIcon.Child = new Image { Source = appIconSource, Width = 25, Height = 25, Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        brand.Children.Add(brandIcon);
+        var brandName = Text("SKU 工具箱", 16, darkMode ? "#F5F6F8" : "#17191D", FontWeights.Bold);
+        brandName.Margin = new Thickness(10, 0, 0, 0);
+        brand.Children.Add(brandName);
+        layout.Children.Add(brand);
+
+        var section = Text("工作台", 11, darkMode ? "#8991A0" : "#8A909B", FontWeights.SemiBold);
+        section.Margin = new Thickness(4, 0, 0, 9);
+        Grid.SetRow(section, 1);
+        layout.Children.Add(section);
+
+        var navPanel = new StackPanel { Orientation = Orientation.Vertical };
+        imageNavButton = SidebarButton("▧  批量改图片");
+        imageNavButton.Click += (s, e) => SetWorkspace(true);
+        navPanel.Children.Add(imageNavButton);
+        folderNavButton = SidebarButton("▤  批量改文件夹");
+        folderNavButton.Margin = new Thickness(0, 5, 0, 0);
+        folderNavButton.Click += (s, e) => SetWorkspace(false);
+        navPanel.Children.Add(folderNavButton);
+        Grid.SetRow(navPanel, 2);
+        layout.Children.Add(navPanel);
+
+        var bottom = new StackPanel { Orientation = Orientation.Vertical };
+        var version = Text("版本 v" + CurrentVersion, 11, darkMode ? "#828A98" : "#959BA5", FontWeights.Normal);
+        bottom.Children.Add(version);
+        var update = new Button
+        {
+            Content = "检查更新",
+            Height = 30,
+            Margin = new Thickness(0, 5, 0, 0),
+            Background = Brushes.Transparent,
+            Foreground = darkMode ? Brush("#BFC6D2") : Brush("#737A86"),
+            BorderThickness = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            FontSize = 12,
+            Cursor = Cursors.Hand
+        };
+        update.Click += (s, e) => CheckForUpdates(false);
+        bottom.Children.Add(update);
+        Grid.SetRow(bottom, 4);
+        layout.Children.Add(bottom);
+        return sidebar;
+    }
+
+    private Button SidebarButton(string text)
+    {
+        return new Button
+        {
+            Content = text,
+            Height = 40,
+            Padding = new Thickness(10, 0, 8, 0),
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Background = Brushes.Transparent,
+            Foreground = darkMode ? Brush("#C7CDD7") : Brush("#5D6572"),
+            BorderThickness = new Thickness(0),
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Cursor = Cursors.Hand,
+            Template = ButtonTemplate(8)
+        };
+    }
+
+    private void SetWorkspace(bool showImages)
+    {
+        imageMode = showImages;
+        imageWorkspace.Visibility = showImages ? Visibility.Visible : Visibility.Collapsed;
+        folderWorkspace.Visibility = showImages ? Visibility.Collapsed : Visibility.Visible;
+        titleText.Text = showImages ? "批量改图片" : "批量改文件夹";
+        imageNavButton.Background = showImages ? (darkMode ? Brush("#29384E") : Brush("#E8F0FF")) : Brushes.Transparent;
+        imageNavButton.Foreground = showImages ? (darkMode ? Brush("#A9C8FF") : Brush("#315DB5")) : (darkMode ? Brush("#C7CDD7") : Brush("#5D6572"));
+        folderNavButton.Background = showImages ? Brushes.Transparent : (darkMode ? Brush("#29384E") : Brush("#E8F0FF"));
+        folderNavButton.Foreground = showImages ? (darkMode ? Brush("#C7CDD7") : Brush("#5D6572")) : (darkMode ? Brush("#A9C8FF") : Brush("#315DB5"));
+    }
+
+    private Grid BuildImageWorkspace()
+    {
+        var page = new Grid { Margin = new Thickness(0, 2, 0, 0) };
+        page.RowDefinitions.Add(new RowDefinition { Height = new GridLength(52) });
+        page.RowDefinitions.Add(new RowDefinition { Height = new GridLength(130) });
+        page.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        page.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var actions = new Grid();
+        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var heading = Text("图片前缀处理", 16, darkMode ? "#F3F4F6" : "#202228", FontWeights.SemiBold);
+        heading.VerticalAlignment = VerticalAlignment.Center;
+        actions.Children.Add(heading);
+        var choose = ToolbarButton("选择图片");
+        choose.Click += (s, e) => ChooseImages();
+        Grid.SetColumn(choose, 1);
+        actions.Children.Add(choose);
+        var clear = ToolbarButton("清空");
+        clear.Margin = new Thickness(8, 0, 0, 0);
+        clear.Click += (s, e) => { selectedImagePaths.Clear(); RenderImageList(); };
+        Grid.SetColumn(clear, 2);
+        actions.Children.Add(clear);
+        page.Children.Add(actions);
+
+        imageDropFrame = new Border
+        {
+            Margin = new Thickness(0, 0, 0, 12),
+            CornerRadius = new CornerRadius(12),
+            BorderBrush = darkMode ? Brush("#353B48") : Brush("#DDE1E8"),
+            BorderThickness = new Thickness(1),
+            Background = darkMode ? Brush("#181B23") : Brushes.White,
+            AllowDrop = true
+        };
+        Grid.SetRow(imageDropFrame, 1);
+        var dropContent = new Grid { Margin = new Thickness(22, 14, 20, 14) };
+        dropContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(52) });
+        dropContent.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        dropContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var imageGlyph = Text("▧", 28, darkMode ? "#A9C8FF" : "#4776D0", FontWeights.Normal);
+        imageGlyph.VerticalAlignment = VerticalAlignment.Center;
+        dropContent.Children.Add(imageGlyph);
+        var instructions = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        instructions.Children.Add(Text("拖入一张或多张图片", 14, darkMode ? "#F2F4F8" : "#252932", FontWeights.SemiBold));
+        var detail = Text("根据每张图片所在文件夹自动识别 SKU，只修改图片文件名", 12, darkMode ? "#A2A9B5" : "#777F8C", FontWeights.Normal);
+        detail.Margin = new Thickness(0, 5, 0, 0);
+        instructions.Children.Add(detail);
+        Grid.SetColumn(instructions, 1);
+        dropContent.Children.Add(instructions);
+        var dropChoose = ActionButton("选择文件", true);
+        dropChoose.Width = 96;
+        dropChoose.Height = 36;
+        dropChoose.Click += (s, e) => ChooseImages();
+        Grid.SetColumn(dropChoose, 2);
+        dropContent.Children.Add(dropChoose);
+        imageDropFrame.Child = dropContent;
+        imageDropFrame.DragEnter += (s, e) => { imageDropFrame.BorderBrush = Brush("#4776D0"); e.Handled = true; };
+        imageDropFrame.DragLeave += (s, e) => { imageDropFrame.BorderBrush = darkMode ? Brush("#353B48") : Brush("#DDE1E8"); };
+        imageDropFrame.Drop += OnImageDrop;
+        page.Children.Add(imageDropFrame);
+
+        imagePageFrame = new Border
+        {
+            Margin = new Thickness(0, 0, 0, 12),
+            CornerRadius = new CornerRadius(12),
+            BorderBrush = darkMode ? Brush("#2B303B") : Brush("#ECEEF2"),
+            BorderThickness = new Thickness(1),
+            Background = darkMode ? Brush("#14171D") : Brushes.White
+        };
+        Grid.SetRow(imagePageFrame, 2);
+        var imageScroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Margin = new Thickness(12) };
+        imageListPanel = new StackPanel();
+        imageScroll.Content = imageListPanel;
+        imagePageFrame.Child = imageScroll;
+        page.Children.Add(imagePageFrame);
+
+        var footer = new Grid { Margin = new Thickness(2, 0, 0, 0) };
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        imageCountLabel = Text("已选择 0 张图片", 12, darkMode ? "#A2A9B5" : "#818894", FontWeights.Normal);
+        imageCountLabel.VerticalAlignment = VerticalAlignment.Center;
+        footer.Children.Add(imageCountLabel);
+        var apply = ActionButton("增加SKU前缀", true);
+        apply.Width = 142;
+        apply.Click += (s, e) => PrefixSelectedImagesWithFolderSku();
+        Grid.SetColumn(apply, 1);
+        footer.Children.Add(apply);
+        Grid.SetRow(footer, 3);
+        page.Children.Add(footer);
+        RenderImageList();
+        return page;
+    }
+
+    private void ChooseImages()
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "选择需要处理的图片",
+            Multiselect = true,
+            CheckFileExists = true,
+            Filter = "图片文件|*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.webp;*.tif;*.tiff;*.heic;*.heif;*.avif|所有文件|*.*"
+        };
+        if (dialog.ShowDialog(this) == true) AddImagePaths(dialog.FileNames);
+    }
+
+    private void OnImageDrop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetDataPresent(DataFormats.FileDrop)) AddImagePaths((string[])e.Data.GetData(DataFormats.FileDrop));
+        imageDropFrame.BorderBrush = darkMode ? Brush("#353B48") : Brush("#DDE1E8");
+        e.Handled = true;
+    }
+
+    private void AddImagePaths(IEnumerable<string> paths)
+    {
+        foreach (var path in paths.Where(File.Exists).Where(p => ImageExtensions.Contains(Path.GetExtension(p))))
+            if (!selectedImagePaths.Contains(path, StringComparer.OrdinalIgnoreCase)) selectedImagePaths.Add(path);
+        RenderImageList();
+    }
+
+    private void RenderImageList()
+    {
+        if (imageListPanel == null) return;
+        imageListPanel.Children.Clear();
+        if (imageCountLabel != null) imageCountLabel.Text = "已选择 " + selectedImagePaths.Count + " 张图片";
+        if (selectedImagePaths.Count == 0)
+        {
+            imageListPanel.Children.Add(new Border
+            {
+                Height = 190,
+                Child = new StackPanel
+                {
+                    VerticalAlignment = VerticalAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Children =
+                    {
+                        Text("等待添加图片", 15, darkMode ? "#D1D5DC" : "#444B56", FontWeights.SemiBold),
+                        WithMargin(Text("图片及对应 SKU 前缀预览会显示在这里", 12, darkMode ? "#858D9A" : "#9AA1AC", FontWeights.Normal), 0, 7, 0, 0)
+                    }
+                }
+            });
+            return;
+        }
+
+        foreach (var path in selectedImagePaths.ToList())
+        {
+            var row = new Grid { Height = 56, Margin = new Thickness(0, 0, 0, 6) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(112) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+            var fileName = Text(Path.GetFileName(path), 13, darkMode ? "#ECEFF4" : "#272B33", FontWeights.SemiBold);
+            var parent = Path.GetDirectoryName(path);
+            string preview;
+            try { preview = "预览：" + GuessSku(new DirectoryInfo(parent).Name) + "-" + Path.GetFileName(path); }
+            catch { preview = "无法从所在文件夹名称识别 SKU"; }
+            var info = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            info.Children.Add(fileName);
+            var pathText = Text(parent, 11, darkMode ? "#8F97A4" : "#9299A4", FontWeights.Normal);
+            pathText.Margin = new Thickness(0, 3, 0, 0);
+            info.Children.Add(pathText);
+            row.Children.Add(info);
+            var previewText = Text(preview, 11, darkMode ? "#ADB7C6" : "#6E7580", FontWeights.Normal);
+            previewText.VerticalAlignment = VerticalAlignment.Center;
+            previewText.TextTrimming = TextTrimming.CharacterEllipsis;
+            Grid.SetColumn(previewText, 1);
+            row.Children.Add(previewText);
+            var remove = new Button { Content = "×", Width = 28, Height = 28, Background = Brushes.Transparent, Foreground = darkMode ? Brush("#9AA3B1") : Brush("#7D8490"), BorderThickness = new Thickness(0), FontSize = 18, Cursor = Cursors.Hand, ToolTip = "移除此图片" };
+            remove.Click += (s, e) => { selectedImagePaths.Remove(path); RenderImageList(); };
+            Grid.SetColumn(remove, 2);
+            row.Children.Add(remove);
+            imageListPanel.Children.Add(new Border
+            {
+                Padding = new Thickness(10, 2, 6, 2),
+                CornerRadius = new CornerRadius(8),
+                Background = darkMode ? Brush("#1B1F27") : Brush("#FAFBFC"),
+                Child = row
+            });
+        }
+    }
+
+    private UIElement BuildToolbar()
+    {
+        var bar = new Grid { Margin = new Thickness(98, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var selectAll = ToolbarButton("全选");
+        var unselectAll = ToolbarButton("取消全选");
+        var clear = ToolbarButton("清空列表");
+        selectAll.ToolTip = "快捷键 Ctrl+A";
+        unselectAll.ToolTip = "取消当前列表所有勾选";
+        clear.ToolTip = "快捷键 Delete，仅清空界面列表，不删除文件";
+        var overwritePanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(18, 0, 0, 0)
+        };
+        overwriteCheck = new CheckBox
+        {
+            Width = 18,
+            Height = 18,
+            VerticalAlignment = VerticalAlignment.Center,
+            Cursor = Cursors.Hand,
+            Margin = new Thickness(0, 3, 8, 0),
+            ToolTip = "勾选后，正式接入逻辑时会把修改结果放回原文件夹路径"
+        };
+        var overwriteText = Text("覆盖源文件", 16, "#222222", FontWeights.SemiBold);
+        overwriteText.VerticalAlignment = VerticalAlignment.Center;
+        toolbarTexts.Add(overwriteText);
+        overwritePanel.Children.Add(overwriteCheck);
+        overwritePanel.Children.Add(overwriteText);
+
+        AddAt(bar, selectAll, 0);
+        AddAt(bar, unselectAll, 1);
+        AddAt(bar, clear, 2);
+        AddAt(bar, overwritePanel, 3);
+        AddAt(bar, BuildNameEditor(), 4);
+
+        var stat = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        var statShow = Text("显示", 15, "#242424", FontWeights.SemiBold);
+        toolbarTexts.Add(statShow);
+        stat.Children.Add(statShow);
+        folderCountText = Text("0", 15, "#111111", FontWeights.Bold);
+        folderCountText.Margin = new Thickness(5, 0, 5, 0);
+        stat.Children.Add(folderCountText);
+        var statMiddle = Text("个文件夹，已处理", 15, "#242424", FontWeights.SemiBold);
+        toolbarTexts.Add(statMiddle);
+        stat.Children.Add(statMiddle);
+        doneCountText = Text("0", 15, "#111111", FontWeights.Bold);
+        doneCountText.Margin = new Thickness(5, 0, 5, 0);
+        stat.Children.Add(doneCountText);
+        var statEnd = Text("个", 15, "#242424", FontWeights.SemiBold);
+        toolbarTexts.Add(statEnd);
+        stat.Children.Add(statEnd);
+        Grid.SetColumn(stat, 6);
+        bar.Children.Add(stat);
+
+        selectAll.Click += (s, e) => { foreach (var row in rows) row.IsSelected = true; UpdateStats(); };
+        unselectAll.Click += (s, e) => { foreach (var row in rows) row.IsSelected = false; UpdateStats(); };
+        clear.Click += (s, e) => ClearRows();
+        return bar;
+    }
+
+    private UIElement BuildListHeader()
+    {
+        var grid = ColumnGrid();
+        grid.Margin = new Thickness(0, 0, 0, 0);
+        AddHeaderText(grid, "文件夹名称", 1);
+        AddHeaderText(grid, "展开选择", 2);
+        AddHeaderText(grid, "自己A图", 3);
+        AddHeaderText(grid, "摄影A图", 4);
+        AddHeaderText(grid, "打开所在文件夹", 5);
+        AddHeaderText(grid, "还原", 6);
+        return grid;
+    }
+
+    private UIElement BuildNameEditor()
+    {
+        var panel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(18, 0, 0, 0)
+        };
+        nameLabelText = Text("人名", 15, "#8A8A8A", FontWeights.Normal);
+        nameLabelText.Margin = new Thickness(0, 0, 10, 0);
+        panel.Children.Add(nameLabelText);
+
+        nameCombo = new ComboBox
+        {
+            Width = 126,
+            Height = 36,
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Background = Brushes.White,
+            Foreground = Brush("#111111"),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(10, 0, 6, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
+            IsEditable = true,
+            Cursor = Cursors.Hand,
+            Template = EditableComboBoxTemplate(18),
+            ItemContainerStyle = ComboBoxItemStyle()
+        };
+        panel.Children.Add(nameCombo);
+
+        saveNameButton = ActionButton("保存", true);
+        saveNameButton.Width = 72;
+        saveNameButton.Height = 36;
+        saveNameButton.FontSize = 15;
+        saveNameButton.Margin = new Thickness(12, 0, 0, 0);
+        saveNameButton.Click += (s, e) => SaveName();
+        panel.Children.Add(saveNameButton);
+
+        LoadNames();
+        return panel;
+    }
+
+    private UIElement BuildFooter()
+    {
+        var footer = new Grid { Margin = new Thickness(24, 16, 0, 0) };
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var leftStack = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+        selectedCountText = Text("已选数量0/总数量0", 13, "#8D8D8D", FontWeights.Normal);
+        leftStack.Children.Add(selectedCountText);
+        footer.Children.Add(leftStack);
+
+        var restoreAll = ActionButton("一键还原", true);
+        restoreAll.Margin = new Thickness(0, 0, 14, 0);
+        Grid.SetColumn(restoreAll, 1);
+        footer.Children.Add(restoreAll);
+
+        var apply = ActionButton("一键修改", true);
+        Grid.SetColumn(apply, 2);
+        footer.Children.Add(apply);
+
+        restoreAll.Click += (s, e) =>
+        {
+            RunBatchRestore();
+        };
+        apply.Click += (s, e) =>
+        {
+            RunBatchRename();
+        };
+        return footer;
+    }
+
+    private void PrefixSelectedImagesWithFolderSku()
+    {
+        var sourceFiles = selectedImagePaths.ToList();
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "选择需要增加文件夹SKU前缀的图片",
+            Multiselect = true,
+            CheckFileExists = true,
+            Filter = "图片文件|*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.webp;*.tif;*.tiff;*.heic;*.heif;*.avif|所有文件|*.*"
+        };
+        if (sourceFiles.Count == 0 && dialog.ShowDialog(this) != true) return;
+
+        var renamed = 0;
+        var skipped = 0;
+        var failures = new List<string>();
+        IEnumerable<string> filesToProcess = sourceFiles.Count > 0 ? (IEnumerable<string>)sourceFiles : dialog.FileNames;
+        foreach (var filePath in filesToProcess.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var folderPath = Path.GetDirectoryName(filePath);
+                if (string.IsNullOrWhiteSpace(folderPath)) throw new InvalidOperationException("无法识别图片所在文件夹");
+                var sku = GuessSku(new DirectoryInfo(folderPath).Name);
+                var fileName = Path.GetFileName(filePath);
+                if (fileName.StartsWith(sku + "-", StringComparison.OrdinalIgnoreCase))
+                {
+                    skipped++;
+                    continue;
+                }
+                var targetPath = Path.Combine(folderPath, sku + "-" + fileName);
+                if (File.Exists(targetPath)) throw new InvalidOperationException("目标文件已存在");
+                File.Move(filePath, targetPath);
+                renamed++;
+            }
+            catch (Exception ex)
+            {
+                failures.Add(Path.GetFileName(filePath) + "：" + ex.Message);
+            }
+        }
+
+        var result = "已增加SKU前缀 " + renamed + " 张";
+        if (skipped > 0) result += "，跳过 " + skipped + " 张";
+        if (failures.Count > 0) result += "，失败 " + failures.Count + " 张";
+        SetHint(result);
+        selectedImagePaths.Clear();
+        RenderImageList();
+        if (failures.Count > 0)
+        {
+            MessageBox.Show(this, result + "\n\n" + string.Join(Environment.NewLine, failures.Take(10).ToArray()), "图片加SKU", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        else
+        {
+            MessageBox.Show(this, result, "图片加SKU", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private void OnDragEnter(object sender, DragEventArgs e)
+    {
+        e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        if (e.Effects == DragDropEffects.Copy && listFrame != null)
+        {
+            listFrame.BorderBrush = Brush("#111111");
+            listFrame.BorderThickness = new Thickness(2);
+            SetHint("松开鼠标即可导入文件夹。");
+        }
+        e.Handled = true;
+    }
+
+    private void OnDragLeave(object sender, DragEventArgs e)
+    {
+        ResetListFrameBorder();
+    }
+
+    private void OnDrop(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
+        ResetListFrameBorder();
+        var paths = ((string[])e.Data.GetData(DataFormats.FileDrop)).Where(Directory.Exists).ToList();
+        if (paths.Count == 0)
+        {
+            SetHint("没有识别到文件夹，请拖入文件夹而不是单张图片。");
+            return;
+        }
+        if (rows.Count == 0) listPanel.Children.Clear();
+        foreach (var path in paths)
+        {
+            if (rows.Any(r => string.Equals(r.FolderPath, path, StringComparison.OrdinalIgnoreCase))) continue;
+            MigrateEmbeddedHistoryIfNeeded(path);
+            var row = new SkuFolderRow(path, UpdateStats);
+            row.SetDarkMode(CurrentDarkMode);
+            rows.Add(row);
+            listPanel.Children.Add(row.Root);
+        }
+        UpdateStats();
+        SetHint("已导入 " + paths.Count + " 个文件夹。");
+    }
+
+    private void AddEmptyState()
+    {
+        listPanel.Children.Clear();
+        var empty = new Border
+        {
+            Height = 470,
+            CornerRadius = new CornerRadius(16),
+            Background = darkMode ? Brush("#181B23") : Brush("#FAFAFA"),
+            BorderBrush = darkMode ? Brush("#262B36") : Brush("#EEEEEE"),
+            BorderThickness = new Thickness(1),
+            Child = new StackPanel
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Children =
+                {
+                    Text("把 SKU 文件夹拖到这里", 26, darkMode ? "#FFFFFF" : "#151515", FontWeights.Bold),
+                    WithMargin(Text("每个文件夹会生成一行，可单独选择变体和 A 图数量", 16, darkMode ? "#B8B8B8" : "#8A8A8A", FontWeights.SemiBold), 0, 12, 0, 0),
+                    WithMargin(Text("支持多选、一键修改、一键还原、覆盖源文件开关", 13, darkMode ? "#8E8E8E" : "#A0A0A0", FontWeights.SemiBold), 0, 8, 0, 0)
+                }
+            }
+        };
+        listPanel.Children.Add(empty);
+    }
+
+    private void UpdateStats()
+    {
+        folderCountText.Text = rows.Count.ToString();
+        doneCountText.Text = rows.Count(r => r.Done).ToString();
+        selectedCountText.Text = "已选数量" + rows.Count(r => r.IsSelected) + "/总数量" + rows.Count;
+    }
+
+    private void ClearRows()
+    {
+        foreach (var row in rows) row.Dispose();
+        rows.Clear();
+        AddEmptyState();
+        UpdateStats();
+        SetHint("列表已清空，文件没有被删除。");
+    }
+
+    private void ResetListFrameBorder()
+    {
+        if (listFrame == null) return;
+        listFrame.BorderBrush = darkMode ? Brush("#333333") : Brush("#F2F2F2");
+        listFrame.BorderThickness = new Thickness(1);
+    }
+
+    private void SetHint(string text)
+    {
+    }
+
+    private void LoadNames()
+    {
+        if (nameCombo == null) return;
+        nameCombo.Items.Clear();
+        if (File.Exists(nameStorePath))
+        {
+            foreach (var name in File.ReadAllLines(nameStorePath).Select(x => x.Trim()).Where(x => x.Length > 0).Distinct())
+                nameCombo.Items.Add(name);
+        }
+        if (nameCombo.Items.Count > 0) nameCombo.SelectedIndex = 0;
+        else nameCombo.Text = "陈鑫荣";
+    }
+
+    private void SaveName()
+    {
+        var name = CleanPersonName(nameCombo.Text);
+        var dir = Path.GetDirectoryName(nameStorePath);
+        if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+        var existing = File.Exists(nameStorePath) ? File.ReadAllLines(nameStorePath).Select(x => x.Trim()).Where(x => x.Length > 0).ToList() : new List<string>();
+        existing.RemoveAll(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase));
+        existing.Insert(0, name);
+        File.WriteAllLines(nameStorePath, existing.ToArray());
+        LoadNames();
+        nameCombo.Text = name;
+        SetHint("已保存人名：" + name);
+    }
+
+    private string GetCurrentPersonName()
+    {
+        return CleanPersonName(nameCombo == null ? "" : nameCombo.Text);
+    }
+
+    private static string CleanPersonName(string value)
+    {
+        var clean = (value ?? "").Trim();
+        if (clean.Length == 0) throw new InvalidOperationException("请先输入人名");
+        foreach (var c in Path.GetInvalidFileNameChars()) clean = clean.Replace(c.ToString(), "");
+        if (clean.Trim().Length == 0) throw new InvalidOperationException("人名包含无效字符");
+        return clean.Trim();
+    }
+
+    private void RunBatchRename()
+    {
+        var targets = rows.Where(r => r.IsSelected).ToList();
+        if (targets.Count == 0)
+        {
+            SetHint("请先勾选需要处理的文件夹。");
+            return;
+        }
+
+        var success = 0;
+        var failures = new List<string>();
+        foreach (var row in targets)
+        {
+            try
+            {
+                var result = ApplyRename(row);
+                row.FolderPath = result.NewFolderPath;
+                row.MarkDone(result.Message);
+                success++;
+            }
+            catch (Exception ex)
+            {
+                row.MarkError(ex.Message);
+                failures.Add(row.DisplayName + "：" + ex.Message);
+            }
+        }
+
+        UpdateStats();
+        SetHint("已完成 " + success + " 个，失败 " + failures.Count + " 个。");
+        if (failures.Count > 0)
+        {
+            MessageBox.Show(this, string.Join(Environment.NewLine, failures.Take(8).ToArray()), Title + " - 部分失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void RunBatchRestore()
+    {
+        var targets = rows.Where(r => r.IsSelected).ToList();
+        if (targets.Count == 0)
+        {
+            SetHint("请先勾选需要还原的文件夹。");
+            return;
+        }
+
+        var success = 0;
+        var failures = new List<string>();
+        foreach (var row in targets)
+        {
+            try
+            {
+                var newPath = RestoreFromHistory(row.FolderPath);
+                row.FolderPath = newPath;
+                row.MarkDone("已还原");
+                success++;
+            }
+            catch (Exception ex)
+            {
+                row.MarkError(ex.Message);
+                failures.Add(row.DisplayName + "：" + ex.Message);
+            }
+        }
+
+        UpdateStats();
+        SetHint("已还原 " + success + " 个，失败 " + failures.Count + " 个。");
+        if (failures.Count > 0)
+        {
+            MessageBox.Show(this, string.Join(Environment.NewLine, failures.Take(8).ToArray()), Title + " - 还原失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private RenameResult ApplyRename(SkuFolderRow row)
+    {
+        if (!Directory.Exists(row.FolderPath)) throw new InvalidOperationException("文件夹不存在");
+        var sku = GuessSku(new DirectoryInfo(row.FolderPath).Name);
+        var option = row.SelectedOption;
+        var personName = GetCurrentPersonName();
+        var originalFolderPath = row.FolderPath;
+        var overwriteSource = overwriteCheck.IsChecked == true;
+        var targetFolderName = BuildFolderTargetName(
+            new DirectoryInfo(originalFolderPath).Name,
+            sku,
+            option,
+            row.SelfCount,
+            row.PhotoCount,
+            row.SelfAllEnabled,
+            row.PhotoAllEnabled);
+        var parent = Directory.GetParent(originalFolderPath);
+        if (parent == null) throw new InvalidOperationException("无法识别上级文件夹");
+        var targetFolderPath = Path.Combine(parent.FullName, targetFolderName);
+
+        var operations = new List<RenameOperation>();
+        if (overwriteSource)
+        {
+            if (!string.Equals(originalFolderPath, targetFolderPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (Directory.Exists(targetFolderPath))
+                {
+                    throw new InvalidOperationException("目标文件夹已存在，不能覆盖已有文件夹");
+                }
+                operations.Add(new RenameOperation("D", originalFolderPath, targetFolderPath));
+                Directory.Move(originalFolderPath, targetFolderPath);
+            }
+        }
+        else
+        {
+            targetFolderPath = UniqueDirectoryPath(targetFolderPath);
+            CopyDirectory(originalFolderPath, targetFolderPath);
+            operations.Add(new RenameOperation("C", originalFolderPath, targetFolderPath));
+        }
+
+        var imageRenamed = 0;
+        var images = new DirectoryInfo(targetFolderPath).GetFiles()
+            .Where(f => ImageExtensions.Contains(f.Extension))
+            .OrderBy(f => GetImageSortKey(f.Name))
+            .ToList();
+        foreach (var file in images)
+        {
+            var originalBaseName = Path.GetFileNameWithoutExtension(file.Name);
+            var destBaseName = BuildImageTargetBaseName(sku, originalBaseName, option, personName);
+            if (string.IsNullOrWhiteSpace(destBaseName)) continue;
+            var dest = Path.Combine(targetFolderPath, destBaseName + file.Extension);
+            if (string.Equals(file.FullName, dest, StringComparison.OrdinalIgnoreCase)) continue;
+            if (File.Exists(dest))
+            {
+                dest = UniqueFilePath(dest);
+            }
+            operations.Add(new RenameOperation("F", file.FullName, dest));
+            File.Move(file.FullName, dest);
+            imageRenamed++;
+        }
+
+        AppendHistory(targetFolderPath, operations);
+        return new RenameResult
+        {
+            NewFolderPath = targetFolderPath,
+            Message = !overwriteSource ? "已生成副本" : (option == MotherOption ? "文件夹+图片" : "图片 " + imageRenamed + " 张")
+        };
+    }
+
+    private static string BuildVariantFolderSuffix(string option, int selfCount, int photoCount, bool selfAll, bool photoAll)
+    {
+        var countSuffix = BuildCountSuffix(selfCount, photoCount, selfAll, photoAll);
+        var suffix = option + "-新拍新修";
+        if (!string.IsNullOrWhiteSpace(countSuffix)) suffix += "-" + countSuffix;
+        return suffix;
+    }
+
+    private static string GetImageLogicOption(string option)
+    {
+        if (option == ColorRetouchOption) return "颜色变体";
+        if (option == QuantityFirstImageOption) return "数量变体";
+        return option;
+    }
+
+    private static string BuildFolderTargetName(string originalFolderName, string sku, string option, int selfCount, int photoCount, bool selfAll = false, bool photoAll = false)
+    {
+        var countSuffix = BuildCountSuffix(selfCount, photoCount, selfAll, photoAll);
+        if (option == NoFolderOption)
+        {
+            return string.IsNullOrWhiteSpace(countSuffix)
+                ? originalFolderName
+                : originalFolderName + "（" + countSuffix + "）";
+        }
+        if (option == MotherOption)
+        {
+            return string.IsNullOrWhiteSpace(countSuffix)
+                ? sku + "（" + MotherOption + "）"
+                : sku + "（" + MotherOption + "-" + countSuffix + "）";
+        }
+        if (option == ColorRetouchOption || option == QuantityFirstImageOption)
+        {
+            return string.IsNullOrWhiteSpace(countSuffix)
+                ? sku + "（" + option + "）"
+                : sku + "（" + option + "-" + countSuffix + "）";
+        }
+        return sku + "（" + BuildVariantFolderSuffix(option, selfCount, photoCount, selfAll, photoAll) + "）";
+    }
+
+    private static string BuildCountSuffix(int selfCount, int photoCount, bool selfAll = false, bool photoAll = false)
+    {
+        if (selfAll) return "全部自a";
+        if (photoAll) return "全部摄影a图";
+        var parts = new List<string>();
+        if (selfCount > 0) parts.Add("自A" + selfCount + "张");
+        if (photoCount > 0) parts.Add("摄影A" + photoCount + "张");
+        return string.Join("，", parts.ToArray());
+    }
+
+    private static string RestoreFromHistory(string folderPath)
+    {
+        if (!Directory.Exists(folderPath)) throw new InvalidOperationException("文件夹不存在");
+        var historyPath = GetHistoryPath(folderPath);
+        if (!File.Exists(historyPath)) throw new InvalidOperationException("没有找到还原记录");
+        var lines = File.ReadAllLines(historyPath).Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+        if (lines.Count == 0) throw new InvalidOperationException("还原记录为空");
+
+        var currentFolder = folderPath;
+        for (var i = lines.Count - 1; i >= 0; i--)
+        {
+            var parts = lines[i].Split('\t');
+            if (parts.Length < 3) continue;
+            var kind = parts[0];
+            var oldPath = parts[1];
+            var newPath = parts[2];
+            if (kind == "F" && File.Exists(newPath))
+            {
+                var restorePath = oldPath;
+                if (File.Exists(restorePath)) restorePath = UniqueFilePath(restorePath);
+                File.Move(newPath, restorePath);
+            }
+        }
+
+        for (var i = lines.Count - 1; i >= 0; i--)
+        {
+            var parts = lines[i].Split('\t');
+            if (parts.Length < 3) continue;
+            if (parts[0] != "D") continue;
+            var oldPath = parts[1];
+            var newPath = parts[2];
+            if (!Directory.Exists(newPath)) continue;
+            var restorePath = oldPath;
+            if (Directory.Exists(restorePath)) restorePath = UniqueDirectoryPath(restorePath);
+            Directory.Move(newPath, restorePath);
+            currentFolder = restorePath;
+        }
+
+        for (var i = lines.Count - 1; i >= 0; i--)
+        {
+            var parts = lines[i].Split('\t');
+            if (parts.Length < 3) continue;
+            if (parts[0] != "C") continue;
+            var copiedPath = parts[2];
+            if (Directory.Exists(copiedPath))
+            {
+                Directory.Delete(copiedPath, true);
+                currentFolder = parts[1];
+            }
+        }
+        RemoveEmbeddedHistoryFiles(currentFolder);
+        if (!IsEmbeddedHistoryPath(historyPath))
+        {
+            TryDeleteFile(historyPath);
+        }
+        return currentFolder;
+    }
+
+    private static void AppendHistory(string folderPath, List<RenameOperation> operations)
+    {
+        if (operations.Count == 0) return;
+        var historyPath = GetExternalHistoryPath(folderPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(historyPath));
+        var lines = operations.Select(o => o.Kind + "\t" + o.OldPath + "\t" + o.NewPath).ToArray();
+        File.AppendAllLines(historyPath, lines);
+        HideHistoryStore();
+        RemoveEmbeddedHistoryFiles(folderPath);
+    }
+
+    private static void RemoveEmbeddedHistoryFiles(string folderPath)
+    {
+        try
+        {
+            var historyPath = Path.Combine(folderPath, HistoryFileName);
+            TryDeleteFile(historyPath);
+            var legacyPath = Path.Combine(folderPath, LegacyHistoryFileName);
+            TryDeleteFile(legacyPath);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void MigrateEmbeddedHistoryIfNeeded(string folderPath)
+    {
+        try
+        {
+            var current = Path.Combine(folderPath, HistoryFileName);
+            var legacy = Path.Combine(folderPath, LegacyHistoryFileName);
+            var embedded = File.Exists(current) ? current : (File.Exists(legacy) ? legacy : null);
+            if (embedded == null) return;
+
+            var external = GetExternalHistoryPath(folderPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(external));
+            if (!File.Exists(external))
+            {
+                File.Copy(embedded, external);
+                HideHistoryStore();
+            }
+            RemoveEmbeddedHistoryFiles(folderPath);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void TryDeleteFile(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath)) return;
+            File.SetAttributes(filePath, FileAttributes.Normal);
+            File.Delete(filePath);
+        }
+        catch
+        {
+        }
+    }
+
+    private static void HideHistoryStore()
+    {
+        try
+        {
+            if (Directory.Exists(HistoryStoreRoot))
+                File.SetAttributes(HistoryStoreRoot, File.GetAttributes(HistoryStoreRoot) | FileAttributes.Hidden);
+        }
+        catch
+        {
+        }
+    }
+
+    private static string GetHistoryPath(string folderPath)
+    {
+        var external = GetExternalHistoryPath(folderPath);
+        if (File.Exists(external)) return external;
+        var current = Path.Combine(folderPath, HistoryFileName);
+        if (File.Exists(current)) return current;
+        var legacy = Path.Combine(folderPath, LegacyHistoryFileName);
+        if (File.Exists(legacy)) return legacy;
+        return external;
+    }
+
+    private static string GetExternalHistoryPath(string folderPath)
+    {
+        var fullPath = Path.GetFullPath(folderPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant();
+        using (var sha = SHA256.Create())
+        {
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(fullPath));
+            var hash = BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+            return Path.Combine(HistoryStoreRoot, hash + ".tsv");
+        }
+    }
+
+    private static bool IsEmbeddedHistoryPath(string historyPath)
+    {
+        var name = Path.GetFileName(historyPath);
+        return string.Equals(name, HistoryFileName, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(name, LegacyHistoryFileName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string UniqueFilePath(string path)
+    {
+        if (!File.Exists(path)) return path;
+        var folder = Path.GetDirectoryName(path);
+        var name = Path.GetFileNameWithoutExtension(path);
+        var ext = Path.GetExtension(path);
+        var index = 1;
+        while (true)
+        {
+            var candidate = Path.Combine(folder, name + " (" + index + ")" + ext);
+            if (!File.Exists(candidate)) return candidate;
+            index++;
+        }
+    }
+
+    private static string UniqueDirectoryPath(string path)
+    {
+        if (!Directory.Exists(path)) return path;
+        var parent = Directory.GetParent(path).FullName;
+        var name = Path.GetFileName(path);
+        var index = 1;
+        while (true)
+        {
+            var candidate = Path.Combine(parent, name + " (" + index + ")");
+            if (!Directory.Exists(candidate)) return candidate;
+            index++;
+        }
+    }
+
+    private static void CopyDirectory(string sourceDir, string targetDir)
+    {
+        Directory.CreateDirectory(targetDir);
+        foreach (var directory in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var relative = directory.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            Directory.CreateDirectory(Path.Combine(targetDir, relative));
+        }
+
+        foreach (var file in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var name = Path.GetFileName(file);
+            if (string.Equals(name, HistoryFileName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, LegacyHistoryFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var relative = file.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var dest = Path.Combine(targetDir, relative);
+            File.Copy(file, dest, true);
+        }
+    }
+
+    private static string GuessSku(string folderName)
+    {
+        var match = Regex.Match(folderName, "[A-Za-z]+(?:-[A-Za-z]+)*-?\\d+(?:-\\d+)*");
+        if (!match.Success) throw new InvalidOperationException("文件夹名里没有识别到 SKU");
+        return match.Value;
+    }
+
+    private static bool StartsWithImageNumber(string baseName)
+    {
+        return Regex.IsMatch(baseName ?? "", "^\\d+(?:\\.\\d+)*");
+    }
+
+    private static string BuildImageTargetBaseName(string sku, string originalBaseName, string option, string personName)
+    {
+        var imageOption = GetImageLogicOption(option);
+        if (IsMainOneImageName(sku, originalBaseName))
+        {
+            var suffix = "";
+            if (imageOption != NoFolderOption && imageOption != MotherOption)
+            {
+                suffix = "（" + imageOption + "）";
+            }
+            return sku + "-" + personName + suffix;
+        }
+        if (originalBaseName.StartsWith(sku + "-", StringComparison.OrdinalIgnoreCase)) return null;
+        if (!StartsWithImageNumber(originalBaseName)) return null;
+        return sku + "-" + originalBaseName;
+    }
+
+    private static bool IsMainOneImageName(string sku, string baseName)
+    {
+        var working = baseName ?? "";
+        if (working.StartsWith(sku + "-", StringComparison.OrdinalIgnoreCase))
+        {
+            working = working.Substring(sku.Length + 1);
+        }
+        if (Regex.IsMatch(working, "^0*1(?![\\d.])")) return true;
+        if (Regex.IsMatch(working, "^[^-（(]+(?:（[^）]+）)?$") && !StartsWithImageNumber(working)) return true;
+        return false;
+    }
+
+    private static string GetImageNumber(string baseName)
+    {
+        var match = Regex.Match(baseName, "\\d+(?:\\.\\d+)*$");
+        if (match.Success) return match.Value.TrimStart('0').Length == 0 ? "1" : match.Value.TrimStart('0');
+        match = Regex.Match(baseName, "\\d+(?:\\.\\d+)*");
+        if (match.Success) return match.Value.TrimStart('0').Length == 0 ? "1" : match.Value.TrimStart('0');
+        return null;
+    }
+
+    private static double GetImageSortKey(string fileName)
+    {
+        var number = GetImageNumber(Path.GetFileNameWithoutExtension(fileName));
+        double parsed;
+        return double.TryParse(number, out parsed) ? parsed : double.MaxValue;
+    }
+
+    private void ToggleChangeLogPopup()
+    {
+        if (changeLogPopup == null)
+        {
+            changeLogPopup = new Popup
+            {
+                PlacementTarget = changeLogButton,
+                Placement = PlacementMode.Bottom,
+                AllowsTransparency = true,
+                StaysOpen = false,
+                HorizontalOffset = -2,
+                VerticalOffset = 8
+            };
+        }
+        changeLogPopup.Child = BuildChangeLogPanel();
+        changeLogPopup.IsOpen = !changeLogPopup.IsOpen;
+    }
+
+    private UIElement BuildChangeLogPanel()
+    {
+        var border = new Border
+        {
+            Width = 300,
+            CornerRadius = new CornerRadius(16),
+            Padding = new Thickness(18, 16, 18, 16),
+            Background = darkMode ? Brush("#181B23") : Brushes.White,
+            BorderBrush = darkMode ? Brush("#2C3240") : Brush("#EFEFEF"),
+            BorderThickness = new Thickness(1),
+            Effect = Shadow(24, 8, 0.18)
+        };
+        var stack = new StackPanel();
+        border.Child = stack;
+        stack.Children.Add(Text("版本优化记录  v" + CurrentVersion, 17, darkMode ? "#FFFFFF" : "#111111", FontWeights.Bold));
+        stack.Children.Add(Spacer(1, 12));
+        AddChangeLogLine(stack, "2026-11-05", "1.0.18 新增批量图片加SKU，可给单张或多张图片增加所在文件夹的SKU前缀。");
+        AddChangeLogLine(stack, "2026-09-09", "1.0.11 新增颜色变体-调色、数量变体改首图，文件夹名称与图片处理规则分别适配。");
+        AddChangeLogLine(stack, "2026-09-09", "补充 1.0.10：优化记录已同步到当前版本，更新进度窗口与自动替换流程也已接入。");
+        AddChangeLogLine(stack, "2026-09-01", "还原记录改为保存在本机数据目录，图片文件夹里不再生成 .sku_rename_history，方便直接发给别人。");
+        AddChangeLogLine(stack, "2026-09-01", "A图数量规则优化：只要填写自己A图/摄影A图，任何展开选择都会追加文件夹后缀。");
+        AddChangeLogLine(stack, "2026-08-29", "新增人名保存、1号图按姓名命名、分享无记录版。");
+        AddChangeLogLine(stack, "2026-08-29", "完善无/之前的母体不计数逻辑，图片数字名前自动加SKU。");
+        AddChangeLogLine(stack, "2026-08-29", "优化深色主题、下拉选项、按钮圆角和单窗口托盘逻辑。");
+        return border;
+    }
+
+    private void AddChangeLogLine(StackPanel stack, string date, string content)
+    {
+        var item = new StackPanel { Margin = new Thickness(0, 0, 0, 11) };
+        item.Children.Add(Text(date, 12, darkMode ? "#8E96A6" : "#9A9A9A", FontWeights.SemiBold));
+        var body = Text(content, 13, darkMode ? "#D8DCE5" : "#333333", FontWeights.Normal);
+        body.Margin = new Thickness(0, 4, 0, 0);
+        body.TextWrapping = TextWrapping.Wrap;
+        body.LineHeight = 20;
+        item.Children.Add(body);
+        stack.Children.Add(item);
+    }
+
+    private string GetUpdateManifestUrl()
+    {
+        var localConfig = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "update-url.txt");
+        if (File.Exists(localConfig))
+        {
+            var url = File.ReadLines(localConfig).Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0 && !l.StartsWith("#"));
+            if (!string.IsNullOrWhiteSpace(url)) return url;
+        }
+        return DefaultUpdateManifestUrl;
+    }
+
+    private void CheckForUpdates(bool silent)
+    {
+        if (IsRunningFromTransientCache())
+        {
+            var tip = "当前程序运行在临时缓存/压缩包路径中，自动更新不会稳定生效。\n\n请先把程序解压到桌面或普通文件夹，再重新打开。";
+            if (!silent) MessageBox.Show(this, tip, "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+            else SetHint("当前运行在缓存路径中，先解压再更新。");
+            return;
+        }
+        var manifestUrl = GetUpdateManifestUrl();
+        if (string.IsNullOrWhiteSpace(manifestUrl))
+        {
+            if (!silent)
+            {
+                MessageBox.Show(this, "还没有配置更新地址。\n\n把 update.json 的链接写入工具同目录的 update-url.txt 后，就可以自动检查更新。", "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            return;
+        }
+
+        if (!silent) SetHint("正在检查更新...");
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            try
+            {
+                string json;
+                using (var client = new WebClient())
+                {
+                    EnableModernTls();
+                    client.Encoding = System.Text.Encoding.UTF8;
+                    json = client.DownloadString(manifestUrl);
+                }
+                var latestVersion = ExtractJsonValue(json, "version");
+                var downloadUrl = ExtractJsonValue(json, "url");
+                var notes = ExtractJsonValue(json, "notes");
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (string.IsNullOrWhiteSpace(latestVersion) || string.IsNullOrWhiteSpace(downloadUrl))
+                    {
+                        if (!silent) MessageBox.Show(this, "更新配置内容不完整，需要包含 version 和 url。", "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+                    if (CompareVersion(latestVersion, CurrentVersion) <= 0)
+                    {
+                        if (!silent) MessageBox.Show(this, "当前已经是最新版本：v" + CurrentVersion, "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                        else SetHint("当前已是最新版本。");
+                        return;
+                    }
+                    var message = "发现新版本：v" + latestVersion + "\n当前版本：v" + CurrentVersion;
+                    if (!string.IsNullOrWhiteSpace(notes)) message += "\n\n" + notes;
+                    message += "\n\n是否立即下载并更新？";
+                    if (MessageBox.Show(this, message, "发现新版本", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
+                    {
+                        DownloadAndInstallUpdate(downloadUrl, latestVersion);
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (!silent) MessageBox.Show(this, "检查更新失败：\n" + ex.Message, "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    else SetHint("检查更新失败，不影响本地使用。");
+                }));
+            }
+        });
+    }
+
+    private void DownloadAndInstallUpdate(string downloadUrl, string latestVersion)
+    {
+        var progress = new UpdateProgressWindow(darkMode) { Owner = this };
+        progress.SetStatus("正在准备下载更新...", 0, true);
+        progress.Show();
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            string tempPath = null;
+            try
+            {
+                var cleanUrl = downloadUrl.Split('?')[0];
+                var ext = Path.GetExtension(cleanUrl);
+                if (string.IsNullOrWhiteSpace(ext)) ext = ".exe";
+                tempPath = Path.Combine(Path.GetTempPath(), "SkuRenameTool-" + latestVersion + ext);
+                var request = (HttpWebRequest)WebRequest.Create(downloadUrl);
+                request.Method = "GET";
+                request.Timeout = 30000;
+                request.ReadWriteTimeout = 30000;
+                request.UserAgent = "Mozilla/5.0";
+                EnableModernTls();
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var input = response.GetResponseStream())
+                using (var output = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    var total = response.ContentLength;
+                    var buffer = new byte[64 * 1024];
+                    long read = 0;
+                    int lastPercent = -1;
+                    int bytesRead;
+                    while (input != null && (bytesRead = input.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        output.Write(buffer, 0, bytesRead);
+                        read += bytesRead;
+                        var percent = total > 0 ? (int)(read * 100 / total) : -1;
+                        if (percent != lastPercent)
+                        {
+                            lastPercent = percent;
+                            var text = total > 0 ? "正在下载更新... " + percent + "%" : "正在下载更新... " + FormatByteSize(read);
+                            Dispatcher.BeginInvoke(new Action(delegate { progress.SetStatus(text, percent, total <= 0); }));
+                        }
+                    }
+                }
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    progress.SetStatus("下载完成，正在安装...", 100, false);
+                    InstallDownloadedUpdate(tempPath, latestVersion, progress);
+                }));
+            }
+            catch (Exception ex)
+            {
+                if (!string.IsNullOrWhiteSpace(tempPath)) TryDeleteFile(tempPath);
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    progress.Close();
+                    MessageBox.Show(this, "下载更新失败：\n" + ex.Message, "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    SetHint("下载更新失败。");
+                }));
+            }
+        });
+    }
+
+    private void InstallDownloadedUpdate(string tempPath, string latestVersion, UpdateProgressWindow progress)
+    {
+        if (IsRunningFromTransientCache())
+        {
+            progress.Close();
+            MessageBox.Show(this, "当前程序运行在临时缓存/压缩包路径中。\n\n自动更新不会稳定生效，请先把程序解压到桌面或普通文件夹后再运行。", "更新已下载", MessageBoxButton.OK, MessageBoxImage.Information);
+            Process.Start("explorer.exe", "/select,\"" + tempPath + "\"");
+            return;
+        }
+        if (!string.Equals(Path.GetExtension(tempPath), ".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            progress.Close();
+            MessageBox.Show(this, "新版本已下载：\n" + tempPath + "\n\n当前自动替换仅支持 exe 更新包。", "更新已下载", MessageBoxButton.OK, MessageBoxImage.Information);
+            Process.Start("explorer.exe", "/select,\"" + tempPath + "\"");
+            return;
+        }
+
+        progress.SetStatus("下载完成，正在替换并重启...", 100, false);
+        var currentExe = Process.GetCurrentProcess().MainModule.FileName;
+        var updater = Path.Combine(Path.GetTempPath(), "SkuRenameToolUpdate-" + Guid.NewGuid().ToString("N") + ".ps1");
+        var backup = currentExe + ".bak";
+        var updateLog = Path.Combine(Path.GetTempPath(), "SkuRenameToolUpdate.log");
+        var currentPid = Process.GetCurrentProcess().Id;
+        File.WriteAllText(updater,
+            "$ErrorActionPreference = 'Stop'\r\n" +
+            "$currentExe = " + PowerShellString(currentExe) + "\r\n" +
+            "$tempPath = " + PowerShellString(tempPath) + "\r\n" +
+            "$backup = " + PowerShellString(backup) + "\r\n" +
+            "$updateLog = " + PowerShellString(updateLog) + "\r\n" +
+            "$pidToWait = " + currentPid + "\r\n" +
+            "$deadline = (Get-Date).AddSeconds(45)\r\n" +
+            "while ((Get-Date) -lt $deadline) {\r\n" +
+            "  $process = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue\r\n" +
+            "  if ($null -eq $process) { break }\r\n" +
+            "  Start-Sleep -Milliseconds 500\r\n" +
+            "}\r\n" +
+            "try {\r\n" +
+            "  if (Test-Path -LiteralPath $currentExe) { Copy-Item -LiteralPath $currentExe -Destination $backup -Force -ErrorAction SilentlyContinue }\r\n" +
+            "  Copy-Item -LiteralPath $tempPath -Destination $currentExe -Force\r\n" +
+            "  Start-Process -FilePath $currentExe\r\n" +
+            "  Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue\r\n" +
+            "} catch {\r\n" +
+            "  ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] update failed: ' + $_.Exception.Message) | Out-File -FilePath $updateLog -Append -Encoding UTF8\r\n" +
+            "  Start-Process explorer.exe -ArgumentList ('/select,\"' + $tempPath + '\"')\r\n" +
+            "} finally {\r\n" +
+            "  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n" +
+            "}\r\n",
+            new System.Text.UTF8Encoding(true));
+        allowExit = true;
+        trayIcon.Visible = false;
+        trayIcon.Dispose();
+        Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -File \"" + updater + "\"") { WindowStyle = ProcessWindowStyle.Hidden, CreateNoWindow = true });
+        Application.Current.Shutdown();
+    }
+
+    private static string PowerShellString(string value)
+    {
+        return "'" + (value ?? "").Replace("'", "''") + "'";
+    }
+
+    private static void EnableModernTls()
+    {
+        try
+        {
+            ServicePointManager.SecurityProtocol = ServicePointManager.SecurityProtocol |
+                (SecurityProtocolType)768 |
+                (SecurityProtocolType)3072;
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool IsRunningFromTransientCache()
+    {
+        var exe = Process.GetCurrentProcess().MainModule.FileName ?? "";
+        return exe.IndexOf(@"\Cache\Zip\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               exe.IndexOf(@"\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               exe.IndexOf(@"\Temp\", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string FormatByteSize(long bytes)
+    {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024d).ToString("0.0") + " KB";
+        return (bytes / 1024d / 1024d).ToString("0.0") + " MB";
+    }
+
+    private sealed class UpdateProgressWindow : Window
+    {
+        private readonly TextBlock statusText;
+        private readonly ProgressBar progressBar;
+
+        public UpdateProgressWindow(bool darkMode)
+        {
+            Title = "检查更新";
+            Width = 420;
+            Height = 160;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            ResizeMode = ResizeMode.NoResize;
+            ShowInTaskbar = false;
+            Topmost = true;
+            Background = darkMode ? Brush("#181B23") : Brushes.White;
+            Foreground = darkMode ? Brushes.White : Brush("#111111");
+            WindowStyle = WindowStyle.ToolWindow;
+            var root = new Border
+            {
+                Margin = new Thickness(16),
+                Padding = new Thickness(18, 16, 18, 16),
+                CornerRadius = new CornerRadius(14),
+                Background = darkMode ? Brush("#12151C") : Brushes.White,
+                BorderBrush = darkMode ? Brush("#2A3040") : Brush("#E7E7E7"),
+                BorderThickness = new Thickness(1)
+            };
+            var stack = new StackPanel();
+            root.Child = stack;
+            stack.Children.Add(Text("正在更新", 18, darkMode ? "#FFFFFF" : "#111111", FontWeights.Bold));
+            statusText = Text("正在准备下载...", 13, darkMode ? "#D8DCE5" : "#444444", FontWeights.Normal);
+            statusText.Margin = new Thickness(0, 10, 0, 8);
+            stack.Children.Add(statusText);
+            progressBar = new ProgressBar
+            {
+                Height = 10,
+                Minimum = 0,
+                Maximum = 100,
+                Value = 0,
+                IsIndeterminate = true,
+                Background = darkMode ? Brush("#262B36") : Brush("#EFEFEF"),
+                Foreground = darkMode ? Brush("#7FA6FF") : Brush("#2F6BFF")
+            };
+            stack.Children.Add(progressBar);
+            Content = root;
+        }
+
+        public void SetStatus(string text, int percent, bool indeterminate)
+        {
+            statusText.Text = text;
+            progressBar.IsIndeterminate = indeterminate;
+            if (!indeterminate)
+            {
+                progressBar.Value = Math.Max(0, Math.Min(100, percent));
+            }
+        }
+    }
+
+    private static string ExtractJsonValue(string json, string key)
+    {
+        var match = Regex.Match(json ?? "", "\"" + Regex.Escape(key) + "\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+        return match.Success ? Regex.Unescape(match.Groups[1].Value) : "";
+    }
+
+    private static int CompareVersion(string left, string right)
+    {
+        Version a;
+        Version b;
+        if (Version.TryParse((left ?? "").Trim().TrimStart('v', 'V'), out a) &&
+            Version.TryParse((right ?? "").Trim().TrimStart('v', 'V'), out b))
+        {
+            return a.CompareTo(b);
+        }
+        return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void SetDarkMode(bool enabled)
+    {
+        darkMode = enabled;
+        CurrentDarkMode = enabled;
+        themeToggle.Content = enabled ? "切换浅色主题" : "切换深色主题";
+        shell.Background = enabled ? Brush("#0F1115") : Brush("#ECECEC");
+        if (sidebarFrame != null)
+        {
+            sidebarFrame.Background = enabled ? Brush("#12151B") : Brushes.White;
+            sidebarFrame.BorderBrush = enabled ? Brush("#252A34") : Brush("#E8E9ED");
+        }
+        listFrame.Background = enabled ? Brush("#151820") : Brushes.White;
+        listFrame.BorderBrush = enabled ? Brush("#333333") : Brush("#F2F2F2");
+        if (iconWrap != null) iconWrap.Background = enabled ? Brush("#181B23") : Brushes.White;
+        if (changeLogButton != null)
+        {
+            changeLogButton.Background = enabled ? Brush("#181B23") : Brushes.White;
+            changeLogButton.Foreground = enabled ? Brush("#A8A8A8") : Brush("#8A8A8A");
+        }
+        if (checkUpdateButton != null)
+        {
+            checkUpdateButton.Background = enabled ? Brush("#262B36") : Brushes.White;
+            checkUpdateButton.Foreground = enabled ? Brushes.White : Brush("#171717");
+        }
+        if (titleText != null) titleText.Foreground = enabled ? Brushes.White : Brush("#111111");
+        if (overwriteCheck != null) overwriteCheck.Foreground = enabled ? Brush("#E8E8E8") : Brush("#222222");
+        if (nameLabelText != null) nameLabelText.Foreground = enabled ? Brush("#A8A8A8") : Brush("#8A8A8A");
+        if (nameCombo != null)
+        {
+            nameCombo.Background = enabled ? Brush("#262B36") : Brushes.White;
+            nameCombo.Foreground = enabled ? Brushes.White : Brush("#111111");
+            nameCombo.ItemContainerStyle = ComboBoxItemStyle();
+        }
+        if (folderCountText != null) folderCountText.Foreground = enabled ? Brushes.White : Brush("#111111");
+        if (doneCountText != null) doneCountText.Foreground = enabled ? Brushes.White : Brush("#111111");
+        if (selectedCountText != null) selectedCountText.Foreground = enabled ? Brush("#A8A8A8") : Brush("#8D8D8D");
+        foreach (var text in headerTexts) text.Foreground = enabled ? Brush("#E8E8E8") : Brush("#242424");
+        foreach (var text in toolbarTexts) text.Foreground = enabled ? Brush("#D8D8D8") : Brush("#242424");
+        foreach (var row in rows) row.SetDarkMode(enabled);
+        if (imageDropFrame != null)
+        {
+            imageDropFrame.Background = enabled ? Brush("#181B23") : Brushes.White;
+            imageDropFrame.BorderBrush = enabled ? Brush("#353B48") : Brush("#DDE1E8");
+        }
+        if (imagePageFrame != null)
+        {
+            imagePageFrame.Background = enabled ? Brush("#14171D") : Brushes.White;
+            imagePageFrame.BorderBrush = enabled ? Brush("#2B303B") : Brush("#ECEEF2");
+        }
+        RenderImageList();
+        SetWorkspace(imageMode);
+        if (rows.Count == 0) AddEmptyState();
+        SetHint(enabled ? "已切换深色主题。" : "已切换浅色主题。");
+    }
+
+    private void ShowFromTray()
+    {
+        Show();
+        WindowState = WindowState.Normal;
+        Activate();
+    }
+
+    private void WaitForShowExistingSignal()
+    {
+        while (!isClosing)
+        {
+            try
+            {
+                showExistingEvent.WaitOne();
+                if (isClosing) break;
+                Dispatcher.BeginInvoke(new Action(ShowFromTray));
+            }
+            catch
+            {
+                break;
+            }
+        }
+    }
+
+    private static Grid ColumnGrid()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(92) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(92) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(112) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(78) });
+        return grid;
+    }
+
+    private void AddHeaderText(Grid grid, string text, int col)
+    {
+        var t = Text(text, 15, "#242424", FontWeights.Bold);
+        t.VerticalAlignment = VerticalAlignment.Center;
+        t.HorizontalAlignment = col == 1 ? HorizontalAlignment.Left : HorizontalAlignment.Center;
+        t.TextAlignment = col == 1 ? TextAlignment.Left : TextAlignment.Center;
+        headerTexts.Add(t);
+        Grid.SetColumn(t, col);
+        grid.Children.Add(t);
+    }
+
+    private static Button ToolbarButton(string text)
+    {
+        var button = new Button
+        {
+            Content = text,
+            Height = 36,
+            MinWidth = 70,
+            Margin = new Thickness(0, 0, 10, 0),
+            Padding = new Thickness(14, 0, 14, 0),
+            Background = Brushes.White,
+            Foreground = Brush("#181818"),
+            BorderThickness = new Thickness(0),
+            FontSize = 16,
+            FontWeight = FontWeights.Bold,
+            Cursor = Cursors.Hand,
+            Template = ButtonTemplate(18)
+        };
+        button.Effect = Shadow(16, 2, 0.04);
+        return button;
+    }
+
+    private static Button ActionButton(string text, bool primary)
+    {
+        return new Button
+        {
+            Content = text,
+            Width = 112,
+            Height = 44,
+            Background = primary ? Brush("#050505") : Brushes.White,
+            Foreground = primary ? Brushes.White : Brush("#111111"),
+            BorderThickness = new Thickness(0),
+            FontSize = 18,
+            FontWeight = FontWeights.Bold,
+            Cursor = Cursors.Hand,
+            Template = ButtonTemplate(22),
+            Effect = primary ? null : Shadow(18, 4, 0.05)
+        };
+    }
+
+    private static Button HeaderActionButton(string text)
+    {
+        return new Button
+        {
+            Content = text,
+            Width = 92,
+            Height = 28,
+            Background = Brushes.White,
+            Foreground = Brush("#8A8A8A"),
+            BorderThickness = new Thickness(0),
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            Cursor = Cursors.Hand,
+            Template = ButtonTemplate(9),
+            Effect = Shadow(12, 2, 0.04)
+        };
+    }
+
+    private static Button CircleButton(string text, double size)
+    {
+        return new Button
+        {
+            Content = text,
+            Width = size,
+            Height = size,
+            Background = Brushes.White,
+            Foreground = Brush("#111111"),
+            BorderThickness = new Thickness(0),
+            FontSize = 15,
+            FontWeight = FontWeights.Bold,
+            Cursor = Cursors.Hand,
+            Template = ButtonTemplate(size / 2),
+            Effect = Shadow(14, 2, 0.05)
+        };
+    }
+
+    private static void AddAt(Grid grid, UIElement element, int col)
+    {
+        Grid.SetColumn(element, col);
+        grid.Children.Add(element);
+    }
+
+    private static FrameworkElement WithMargin(FrameworkElement element, double l, double t, double r, double b)
+    {
+        element.Margin = new Thickness(l, t, r, b);
+        return element;
+    }
+
+    private static FrameworkElement Spacer(double width, double height)
+    {
+        return new Border { Width = width, Height = height, Background = Brushes.Transparent };
+    }
+
+    private static TextBlock Text(string text, double size, string color, FontWeight weight)
+    {
+        return new TextBlock
+        {
+            Text = text,
+            FontSize = size,
+            Foreground = Brush(color),
+            FontWeight = weight,
+            FontFamily = new FontFamily(AppFontFamily),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+    }
+
+    private static Brush Brush(string color)
+    {
+        return (Brush)new BrushConverter().ConvertFromString(color);
+    }
+
+    private static DropShadowEffect Shadow(double blur, double depth, double opacity)
+    {
+        return new DropShadowEffect
+        {
+            BlurRadius = blur,
+            ShadowDepth = depth,
+            Opacity = opacity,
+            Direction = 270,
+            Color = Colors.Black
+        };
+    }
+
+    private static ControlTemplate ButtonTemplate(double radius)
+    {
+        var template = new ControlTemplate(typeof(Button));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.Name = "Chrome";
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        border.AppendChild(presenter);
+        template.VisualTree = border;
+        var hover = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+        hover.Setters.Add(new Setter(Button.OpacityProperty, 0.88));
+        template.Triggers.Add(hover);
+        var pressed = new Trigger { Property = Button.IsPressedProperty, Value = true };
+        pressed.Setters.Add(new Setter(Button.OpacityProperty, 0.72));
+        template.Triggers.Add(pressed);
+        return template;
+    }
+
+    private static ControlTemplate RoundedToggleTemplate(double radius)
+    {
+        var template = new ControlTemplate(typeof(ToggleButton));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ToggleButton.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        border.AppendChild(presenter);
+        template.VisualTree = border;
+        var hover = new Trigger { Property = ToggleButton.IsMouseOverProperty, Value = true };
+        hover.Setters.Add(new Setter(ToggleButton.OpacityProperty, 0.88));
+        template.Triggers.Add(hover);
+        var checkedTrigger = new Trigger { Property = ToggleButton.IsCheckedProperty, Value = true };
+        checkedTrigger.Setters.Add(new Setter(ToggleButton.BackgroundProperty, Brush("#050505")));
+        checkedTrigger.Setters.Add(new Setter(ToggleButton.ForegroundProperty, Brushes.White));
+        template.Triggers.Add(checkedTrigger);
+        return template;
+    }
+
+    private static ControlTemplate TextBoxTemplate(double radius)
+    {
+        var template = new ControlTemplate(typeof(TextBox));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(TextBox.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        var host = new FrameworkElementFactory(typeof(ScrollViewer));
+        host.Name = "PART_ContentHost";
+        host.SetValue(FrameworkElement.MarginProperty, new Thickness(0));
+        border.AppendChild(host);
+        template.VisualTree = border;
+        return template;
+    }
+
+    private static ControlTemplate ComboBoxTemplate(double radius)
+    {
+        var template = new ControlTemplate(typeof(ComboBox));
+        var root = new FrameworkElementFactory(typeof(Grid));
+
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ComboBox.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        root.AppendChild(border);
+
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.MarginProperty, new Thickness(11, 0, 26, 0));
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Left);
+        presenter.SetValue(ContentPresenter.ContentProperty, new TemplateBindingExtension(ComboBox.SelectionBoxItemProperty));
+        root.AppendChild(presenter);
+
+        var arrow = new FrameworkElementFactory(typeof(TextBlock));
+        arrow.SetValue(TextBlock.TextProperty, "⌄");
+        arrow.SetValue(TextBlock.FontSizeProperty, 16.0);
+        arrow.SetValue(TextBlock.ForegroundProperty, Brush("#666666"));
+        arrow.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right);
+        arrow.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+        arrow.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 9, 4));
+        root.AppendChild(arrow);
+
+        var toggle = new FrameworkElementFactory(typeof(ToggleButton));
+        toggle.SetValue(ToggleButton.BackgroundProperty, Brushes.Transparent);
+        toggle.SetValue(ToggleButton.BorderThicknessProperty, new Thickness(0));
+        toggle.SetValue(ToggleButton.FocusableProperty, false);
+        toggle.SetValue(ToggleButton.TemplateProperty, TransparentToggleTemplate());
+        toggle.SetBinding(ToggleButton.IsCheckedProperty, new System.Windows.Data.Binding("IsDropDownOpen")
+        {
+            RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.TemplatedParent),
+            Mode = System.Windows.Data.BindingMode.TwoWay
+        });
+        root.AppendChild(toggle);
+
+        var popup = new FrameworkElementFactory(typeof(Popup));
+        popup.Name = "PART_Popup";
+        popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
+        popup.SetValue(Popup.AllowsTransparencyProperty, true);
+        popup.SetValue(Popup.FocusableProperty, false);
+        popup.SetValue(Popup.IsOpenProperty, new TemplateBindingExtension(ComboBox.IsDropDownOpenProperty));
+
+        var popupBorder = new FrameworkElementFactory(typeof(Border));
+        popupBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ComboBox.BackgroundProperty));
+        popupBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        popupBorder.SetValue(Border.MarginProperty, new Thickness(0, 4, 0, 0));
+        popupBorder.SetValue(Border.EffectProperty, Shadow(16, 3, 0.12));
+        popupBorder.SetValue(FrameworkElement.WidthProperty, new TemplateBindingExtension(ComboBox.ActualWidthProperty));
+        var scroll = new FrameworkElementFactory(typeof(ScrollViewer));
+        scroll.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Hidden);
+        var items = new FrameworkElementFactory(typeof(ItemsPresenter));
+        scroll.AppendChild(items);
+        popupBorder.AppendChild(scroll);
+        popup.AppendChild(popupBorder);
+        root.AppendChild(popup);
+
+        template.VisualTree = root;
+        return template;
+    }
+
+    private static ControlTemplate EditableComboBoxTemplate(double radius)
+    {
+        var template = new ControlTemplate(typeof(ComboBox));
+        var root = new FrameworkElementFactory(typeof(Grid));
+
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ComboBox.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        root.AppendChild(border);
+
+        var textBox = new FrameworkElementFactory(typeof(TextBox));
+        textBox.Name = "PART_EditableTextBox";
+        textBox.SetValue(TextBox.BackgroundProperty, Brushes.Transparent);
+        textBox.SetValue(TextBox.BorderThicknessProperty, new Thickness(0));
+        textBox.SetValue(TextBox.ForegroundProperty, new TemplateBindingExtension(ComboBox.ForegroundProperty));
+        textBox.SetValue(TextBox.FontFamilyProperty, new FontFamily(AppFontFamily));
+        textBox.SetValue(TextBox.FontSizeProperty, new TemplateBindingExtension(ComboBox.FontSizeProperty));
+        textBox.SetValue(TextBox.FontWeightProperty, new TemplateBindingExtension(ComboBox.FontWeightProperty));
+        textBox.SetValue(TextBox.VerticalContentAlignmentProperty, VerticalAlignment.Center);
+        textBox.SetValue(TextBox.PaddingProperty, new Thickness(12, 0, 28, 0));
+        root.AppendChild(textBox);
+
+        var arrow = new FrameworkElementFactory(typeof(TextBlock));
+        arrow.SetValue(TextBlock.TextProperty, "⌄");
+        arrow.SetValue(TextBlock.FontSizeProperty, 16.0);
+        arrow.SetValue(TextBlock.ForegroundProperty, Brush("#666666"));
+        arrow.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right);
+        arrow.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+        arrow.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 9, 4));
+        root.AppendChild(arrow);
+
+        var toggle = new FrameworkElementFactory(typeof(ToggleButton));
+        toggle.SetValue(ToggleButton.BackgroundProperty, Brushes.Transparent);
+        toggle.SetValue(ToggleButton.BorderThicknessProperty, new Thickness(0));
+        toggle.SetValue(ToggleButton.FocusableProperty, false);
+        toggle.SetValue(ToggleButton.TemplateProperty, TransparentToggleTemplate());
+        toggle.SetBinding(ToggleButton.IsCheckedProperty, new System.Windows.Data.Binding("IsDropDownOpen")
+        {
+            RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.TemplatedParent),
+            Mode = System.Windows.Data.BindingMode.TwoWay
+        });
+        root.AppendChild(toggle);
+
+        var popup = new FrameworkElementFactory(typeof(Popup));
+        popup.Name = "PART_Popup";
+        popup.SetValue(Popup.PlacementProperty, PlacementMode.Bottom);
+        popup.SetValue(Popup.AllowsTransparencyProperty, true);
+        popup.SetValue(Popup.FocusableProperty, false);
+        popup.SetValue(Popup.IsOpenProperty, new TemplateBindingExtension(ComboBox.IsDropDownOpenProperty));
+
+        var popupBorder = new FrameworkElementFactory(typeof(Border));
+        popupBorder.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(ComboBox.BackgroundProperty));
+        popupBorder.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
+        popupBorder.SetValue(Border.MarginProperty, new Thickness(0, 4, 0, 0));
+        popupBorder.SetValue(Border.EffectProperty, Shadow(16, 3, 0.12));
+        popupBorder.SetValue(FrameworkElement.WidthProperty, new TemplateBindingExtension(ComboBox.ActualWidthProperty));
+        var scroll = new FrameworkElementFactory(typeof(ScrollViewer));
+        scroll.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Hidden);
+        var items = new FrameworkElementFactory(typeof(ItemsPresenter));
+        scroll.AppendChild(items);
+        popupBorder.AppendChild(scroll);
+        popup.AppendChild(popupBorder);
+        root.AppendChild(popup);
+
+        template.VisualTree = root;
+        return template;
+    }
+
+    private static Style ComboBoxItemStyle()
+    {
+        var style = new Style(typeof(ComboBoxItem));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.BackgroundProperty, Brushes.Transparent));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.FontFamilyProperty, new FontFamily(AppFontFamily)));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.FontSizeProperty, 13.0));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.FontWeightProperty, FontWeights.SemiBold));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.ForegroundProperty, CurrentDarkMode ? Brushes.White : Brush("#111111")));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.PaddingProperty, new Thickness(10, 7, 10, 7)));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Left));
+        style.Setters.Add(new Setter(System.Windows.Controls.Control.TemplateProperty, ComboBoxItemTemplate()));
+        var hover = new Trigger { Property = ComboBoxItem.IsHighlightedProperty, Value = true };
+        hover.Setters.Add(new Setter(System.Windows.Controls.Control.BackgroundProperty, CurrentDarkMode ? Brush("#333947") : Brush("#E9E9E9")));
+        hover.Setters.Add(new Setter(System.Windows.Controls.Control.ForegroundProperty, CurrentDarkMode ? Brushes.White : Brush("#111111")));
+        style.Triggers.Add(hover);
+        var selected = new Trigger { Property = ComboBoxItem.IsSelectedProperty, Value = true };
+        selected.Setters.Add(new Setter(System.Windows.Controls.Control.BackgroundProperty, CurrentDarkMode ? Brush("#3B4252") : Brush("#E9EEF7")));
+        selected.Setters.Add(new Setter(System.Windows.Controls.Control.ForegroundProperty, CurrentDarkMode ? Brushes.White : Brush("#111111")));
+        style.Triggers.Add(selected);
+        return style;
+    }
+
+    private static ControlTemplate ComboBoxItemTemplate()
+    {
+        var template = new ControlTemplate(typeof(ComboBoxItem));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(System.Windows.Controls.Control.BackgroundProperty));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+        border.SetValue(Border.MarginProperty, new Thickness(4, 2, 4, 2));
+        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+        presenter.SetValue(ContentPresenter.MarginProperty, new TemplateBindingExtension(System.Windows.Controls.Control.PaddingProperty));
+        presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Left);
+        presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+        border.AppendChild(presenter);
+        template.VisualTree = border;
+        return template;
+    }
+
+    private static ControlTemplate TransparentToggleTemplate()
+    {
+        var template = new ControlTemplate(typeof(ToggleButton));
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.SetValue(Border.BackgroundProperty, Brushes.Transparent);
+        template.VisualTree = border;
+        return template;
+    }
+
+    private static bool IsInteractive(DependencyObject obj)
+    {
+        while (obj != null)
+        {
+            if (obj is Button || obj is TextBox || obj is ComboBox || obj is CheckBox || obj is ToggleButton) return true;
+            obj = VisualTreeHelper.GetParent(obj);
+        }
+        return false;
+    }
+
+    private static System.Drawing.Icon LoadIcon()
+    {
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sku-source.ico");
+        if (File.Exists(path)) return new System.Drawing.Icon(path);
+        try
+        {
+            return System.Drawing.Icon.ExtractAssociatedIcon(Process.GetCurrentProcess().MainModule.FileName);
+        }
+        catch
+        {
+            return System.Drawing.SystemIcons.Application;
+        }
+    }
+
+    private sealed class RenameOperation
+    {
+        public string Kind { get; private set; }
+        public string OldPath { get; private set; }
+        public string NewPath { get; private set; }
+
+        public RenameOperation(string kind, string oldPath, string newPath)
+        {
+            Kind = kind;
+            OldPath = oldPath;
+            NewPath = newPath;
+        }
+    }
+
+    private sealed class RenameResult
+    {
+        public string NewFolderPath { get; set; }
+        public string Message { get; set; }
+    }
+
+    private sealed class SkuFolderRow
+    {
+        private static readonly string[] Variants =
+        {
+            "无",
+            "款式变体",
+            "颜色变体",
+            "颜色变体-调色",
+            "组合变体",
+            "数量变体",
+            "数量变体改首图",
+            "尺寸变体",
+            "之前的母体不计数"
+        };
+        private readonly CheckBox checkBox;
+        private readonly Button expandButton;
+        private readonly TextBlock folderNameText;
+        private readonly TextBlock skuText;
+        private readonly ComboBox variantCombo;
+        private readonly TextBox selfCountBox;
+        private readonly TextBox photoCountBox;
+        private readonly CheckBox selfAllCheck;
+        private readonly CheckBox photoSelfCheck;
+        private readonly TextBlock previewText;
+        private readonly Border detailPanel;
+        private readonly TextBlock statusPill;
+        private readonly TextBlock imageCountText;
+        private readonly Button openButton;
+        private readonly Button restoreButton;
+        private FileSystemWatcher watcher;
+        private bool expanded;
+        private bool updatingImageMode;
+
+        private string folderPath;
+        public string FolderPath
+        {
+            get { return folderPath; }
+            set
+            {
+                folderPath = value;
+                if (folderNameText != null && Directory.Exists(folderPath))
+                {
+                    var folder = new DirectoryInfo(folderPath);
+                    folderNameText.Text = folder.Name;
+                    skuText.Text = "SKU：" + GuessSku(folder.Name);
+                }
+                StartWatch();
+                RefreshImageCount();
+            }
+        }
+        public Border Root { get; private set; }
+        public bool Done { get; private set; }
+        public string DisplayName { get { return new DirectoryInfo(FolderPath).Name; } }
+        public string SelectedOption { get { return variantCombo.SelectedItem == null ? "款式变体" : variantCombo.SelectedItem.ToString(); } }
+        public int SelfCount { get { return ParseCount(selfCountBox.Text); } }
+        public int PhotoCount { get { return ParseCount(photoCountBox.Text); } }
+        public bool SelfAllEnabled { get { return selfAllCheck.IsChecked == true; } }
+        public bool PhotoAllEnabled { get { return photoSelfCheck.IsChecked == true; } }
+        private readonly Action changed;
+
+        public bool IsSelected
+        {
+            get { return checkBox.IsChecked == true; }
+            set { checkBox.IsChecked = value; }
+        }
+
+        public SkuFolderRow(string folderPath, Action changedCallback)
+        {
+            this.folderPath = folderPath;
+            changed = changedCallback;
+            var folder = new DirectoryInfo(folderPath);
+
+            Root = new Border
+            {
+                Background = Brush("#F7F8FA"),
+                CornerRadius = new CornerRadius(16),
+                Margin = new Thickness(0, 0, 0, 12),
+                Padding = new Thickness(0),
+                BorderBrush = Brush("#EFEFEF"),
+                BorderThickness = new Thickness(1)
+            };
+
+            var stack = new StackPanel();
+            Root.Child = stack;
+
+            var grid = ColumnGrid();
+            grid.Height = 70;
+            grid.Margin = new Thickness(0, 0, 0, 0);
+            stack.Children.Add(grid);
+
+            checkBox = new CheckBox
+            {
+                IsChecked = true,
+                Width = 20,
+                Height = 20,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Cursor = Cursors.Hand
+            };
+            Grid.SetColumn(checkBox, 0);
+            grid.Children.Add(checkBox);
+
+            var nameStack = new StackPanel { Orientation = Orientation.Vertical, VerticalAlignment = VerticalAlignment.Center };
+            folderNameText = Text(folder.Name, 16, "#111111", FontWeights.Bold);
+            skuText = Text("SKU：" + GuessSku(folder.Name), 12, "#8A8A8A", FontWeights.SemiBold);
+            skuText.Margin = new Thickness(0, 4, 0, 0);
+            imageCountText = Text("", 11, "#A0A0A0", FontWeights.Normal);
+            imageCountText.Margin = new Thickness(0, 3, 0, 0);
+            nameStack.Children.Add(folderNameText);
+            nameStack.Children.Add(skuText);
+            nameStack.Children.Add(imageCountText);
+            Grid.SetColumn(nameStack, 1);
+            grid.Children.Add(nameStack);
+
+            variantCombo = new ComboBox
+            {
+                Height = 36,
+                Width = 126,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Background = Brush("#F0F0F0"),
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(10, 0, 6, 0),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Cursor = Cursors.Hand,
+                Template = ComboBoxTemplate(12)
+            };
+            foreach (var item in Variants) variantCombo.Items.Add(item);
+            variantCombo.SelectedIndex = 0;
+            variantCombo.ItemContainerStyle = ComboBoxItemStyle();
+            Grid.SetColumn(variantCombo, 2);
+            grid.Children.Add(variantCombo);
+
+            selfCountBox = NumberBox("0");
+            selfAllCheck = ImageModeCheck("勾选即表示全部自a");
+            var selfPanel = ImageInputPanel(selfCountBox, selfAllCheck);
+            Grid.SetColumn(selfPanel, 3);
+            grid.Children.Add(selfPanel);
+
+            photoCountBox = NumberBox("0");
+            photoSelfCheck = ImageModeCheck("勾选即表示全部摄影a图");
+            var photoPanel = ImageInputPanel(photoCountBox, photoSelfCheck);
+            Grid.SetColumn(photoPanel, 4);
+            grid.Children.Add(photoPanel);
+
+            openButton = SmallRowButton("打开");
+            openButton.Click += (s, e) =>
+            {
+                try { Process.Start("explorer.exe", FolderPath); } catch { }
+            };
+            Grid.SetColumn(openButton, 5);
+            grid.Children.Add(openButton);
+
+            restoreButton = SmallRowButton("还原");
+            restoreButton.Click += (s, e) =>
+            {
+                try
+                {
+                    FolderPath = MainWindow.RestoreFromHistory(FolderPath);
+                    MarkDone("已还原");
+                    changed();
+                }
+                catch (Exception ex)
+                {
+                    MarkError(ex.Message);
+                    MessageBox.Show(ex.Message, "还原失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            };
+            Grid.SetColumn(restoreButton, 6);
+            grid.Children.Add(restoreButton);
+
+            expandButton = new Button
+            {
+                Content = "展开选项",
+                Height = 28,
+                Width = 80,
+                Margin = new Thickness(0, -4, 0, 10),
+                Background = Brushes.White,
+                Foreground = Brush("#111111"),
+                BorderThickness = new Thickness(0),
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Cursor = Cursors.Hand,
+                Template = ButtonTemplate(14)
+            };
+            expandButton.HorizontalAlignment = HorizontalAlignment.Left;
+            expandButton.Margin = new Thickness(32, -4, 0, 10);
+            stack.Children.Add(expandButton);
+
+            detailPanel = new Border
+            {
+                Visibility = Visibility.Collapsed,
+                Background = Brushes.White,
+                CornerRadius = new CornerRadius(14),
+                Margin = new Thickness(32, 0, 14, 14),
+                Padding = new Thickness(16, 12, 16, 12)
+            };
+            var detailGrid = new Grid();
+            detailGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            detailGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(130) });
+            detailPanel.Child = detailGrid;
+            previewText = Text("", 13, "#111111", FontWeights.SemiBold);
+            previewText.TextWrapping = TextWrapping.Wrap;
+            detailGrid.Children.Add(previewText);
+            statusPill = Text("待修改", 13, "#21764B", FontWeights.Bold);
+            statusPill.HorizontalAlignment = HorizontalAlignment.Right;
+            Grid.SetColumn(statusPill, 1);
+            detailGrid.Children.Add(statusPill);
+            stack.Children.Add(detailPanel);
+
+            checkBox.Checked += (s, e) => changed();
+            checkBox.Unchecked += (s, e) => changed();
+            variantCombo.SelectionChanged += (s, e) => UpdatePreview();
+            selfCountBox.TextChanged += (s, e) => UpdatePreview();
+            photoCountBox.TextChanged += (s, e) => UpdatePreview();
+            selfAllCheck.Checked += (s, e) => SetImageMode(selfAllCheck, photoSelfCheck);
+            photoSelfCheck.Checked += (s, e) => SetImageMode(photoSelfCheck, selfAllCheck);
+            selfAllCheck.Unchecked += (s, e) => UpdatePreview();
+            photoSelfCheck.Unchecked += (s, e) => UpdatePreview();
+            expandButton.Click += (s, e) =>
+            {
+                expanded = !expanded;
+                detailPanel.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+                expandButton.Content = expanded ? "收起选项" : "展开选项";
+            };
+            UpdatePreview();
+            StartWatch();
+            RefreshImageCount();
+        }
+
+        public void MarkDone(string message)
+        {
+            Done = true;
+            statusPill.Text = message;
+            statusPill.Foreground = Brush("#21764B");
+            SetDarkMode(CurrentDarkMode);
+        }
+
+        public void MarkError(string message)
+        {
+            Done = false;
+            statusPill.Text = "失败";
+            statusPill.Foreground = Brush("#D92D20");
+            previewText.Text = "错误：" + message;
+            Root.Background = CurrentDarkMode ? Brush("#2A1F23") : Brush("#FFF1F1");
+            Root.BorderBrush = CurrentDarkMode ? Brush("#5B3038") : Brush("#FFD1D1");
+        }
+
+        public void Dispose()
+        {
+            if (watcher != null)
+            {
+                watcher.EnableRaisingEvents = false;
+                watcher.Dispose();
+                watcher = null;
+            }
+        }
+
+        private void StartWatch()
+        {
+            Dispose();
+            if (!Directory.Exists(FolderPath)) return;
+            watcher = new FileSystemWatcher(FolderPath);
+            watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime | NotifyFilters.LastWrite;
+            watcher.Created += (s, e) => RefreshImageCountSoon();
+            watcher.Deleted += (s, e) => RefreshImageCountSoon();
+            watcher.Renamed += (s, e) => RefreshImageCountSoon();
+            watcher.EnableRaisingEvents = true;
+        }
+
+        private void RefreshImageCountSoon()
+        {
+            try
+            {
+                Root.Dispatcher.BeginInvoke(new Action(RefreshImageCount));
+            }
+            catch
+            {
+            }
+        }
+
+        private void RefreshImageCount()
+        {
+            if (!Directory.Exists(FolderPath))
+            {
+                imageCountText.Text = "图片：文件夹不存在";
+                return;
+            }
+            var count = new DirectoryInfo(FolderPath).GetFiles().Count(f => ImageExtensions.Contains(f.Extension));
+            imageCountText.Text = "图片：" + count + " 张";
+            UpdatePreview();
+        }
+
+        public void SetDarkMode(bool enabled)
+        {
+            if (Done)
+            {
+                Root.Background = enabled ? Brush("#20242E") : Brush("#F2FBF6");
+                Root.BorderBrush = enabled ? Brush("#353B48") : Brush("#BDE8CE");
+            }
+            else
+            {
+                Root.Background = enabled ? Brush("#181B23") : Brush("#F7F8FA");
+                Root.BorderBrush = enabled ? Brush("#262B36") : Brush("#EFEFEF");
+            }
+            detailPanel.Background = enabled ? Brush("#20242E") : Brushes.White;
+            folderNameText.Foreground = enabled ? Brushes.White : Brush("#111111");
+            skuText.Foreground = enabled ? Brush("#B0B0B0") : Brush("#8A8A8A");
+            imageCountText.Foreground = enabled ? Brush("#858B96") : Brush("#A0A0A0");
+            previewText.Foreground = enabled ? Brushes.White : Brush("#111111");
+            variantCombo.Background = enabled ? Brush("#262B36") : Brush("#F0F0F0");
+            variantCombo.Foreground = enabled ? Brushes.White : Brush("#111111");
+            variantCombo.IsDropDownOpen = false;
+            variantCombo.ItemContainerStyle = ComboBoxItemStyle();
+            selfCountBox.Background = enabled ? Brush("#262B36") : Brushes.White;
+            selfCountBox.Foreground = enabled ? Brushes.White : Brush("#111111");
+            photoCountBox.Background = enabled ? Brush("#262B36") : Brushes.White;
+            photoCountBox.Foreground = enabled ? Brushes.White : Brush("#111111");
+            selfAllCheck.Foreground = enabled ? Brushes.White : Brush("#111111");
+            photoSelfCheck.Foreground = enabled ? Brushes.White : Brush("#111111");
+            selfAllCheck.Background = enabled ? Brush("#262B36") : Brushes.White;
+            photoSelfCheck.Background = enabled ? Brush("#262B36") : Brushes.White;
+            expandButton.Background = enabled ? Brush("#262B36") : Brushes.White;
+            expandButton.Foreground = enabled ? Brush("#EDEDED") : Brush("#111111");
+            expandButton.BorderThickness = new Thickness(0);
+            openButton.Background = enabled ? Brushes.White : Brush("#050505");
+            openButton.Foreground = enabled ? Brush("#050505") : Brushes.White;
+            restoreButton.Background = enabled ? Brushes.White : Brush("#050505");
+            restoreButton.Foreground = enabled ? Brush("#050505") : Brushes.White;
+        }
+
+        private void UpdatePreview()
+        {
+            var sku = GuessSku(new DirectoryInfo(FolderPath).Name);
+            var variant = variantCombo.SelectedItem == null ? "款式变体" : variantCombo.SelectedItem.ToString();
+            var selfCount = ParseCount(selfCountBox.Text);
+            var photoCount = ParseCount(photoCountBox.Text);
+            var targetName = BuildFolderTargetName(new DirectoryInfo(FolderPath).Name, sku, variant, selfCount, photoCount, SelfAllEnabled, PhotoAllEnabled);
+            if (!Done) statusPill.Text = "待修改";
+            if (variant == NoFolderOption && selfCount <= 0 && photoCount <= 0)
+            {
+                previewText.Text = "预览：文件夹名不改，只给图片数字名前加 SKU";
+                return;
+            }
+            var extra = variant == MotherOption || variant == NoFolderOption ? "  图片按“无”处理" : "";
+            previewText.Text = "预览：" + targetName + extra;
+        }
+
+        private static TextBox NumberBox(string text)
+        {
+            var box = new TextBox
+            {
+                Text = text,
+                Width = 58,
+                Height = 36,
+                FontSize = 14,
+                FontWeight = FontWeights.Bold,
+                TextAlignment = TextAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.White,
+                Foreground = Brush("#111111"),
+                Template = TextBoxTemplate(12)
+            };
+            box.PreviewTextInput += (s, e) => e.Handled = !e.Text.All(char.IsDigit);
+            return box;
+        }
+
+        private static CheckBox ImageModeCheck(string tip)
+        {
+            return new CheckBox
+            {
+                Width = 18,
+                Height = 18,
+                Content = "",
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand,
+                ToolTip = tip,
+                FocusVisualStyle = null,
+                Template = FixedCheckBoxTemplate(),
+                IsHitTestVisible = true,
+                Margin = new Thickness(0, 3, 0, 0)
+            };
+        }
+
+        private static StackPanel ImageInputPanel(TextBox countBox, CheckBox modeCheck)
+        {
+            var panel = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            panel.Children.Add(countBox);
+            var modeLine = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+            var tip = modeCheck.ToolTip == null ? "" : modeCheck.ToolTip.ToString();
+            modeCheck.ToolTip = null;
+            modeLine.Children.Add(modeCheck);
+            modeLine.Children.Add(HelpIcon(tip));
+            panel.Children.Add(modeLine);
+            return panel;
+        }
+
+        private static TextBlock HelpIcon(string tip)
+        {
+            return new TextBlock
+            {
+                Text = "?",
+                Width = 16,
+                Height = 16,
+                TextAlignment = TextAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brush("#7C8492"),
+                ToolTip = tip,
+                Cursor = Cursors.Help,
+                Margin = new Thickness(3, 3, 0, 0)
+            };
+        }
+
+        private static ControlTemplate FixedCheckBoxTemplate()
+        {
+            var template = new ControlTemplate(typeof(CheckBox));
+            var border = new FrameworkElementFactory(typeof(Border));
+            border.Name = "Box";
+            border.SetValue(Border.WidthProperty, 16.0);
+            border.SetValue(Border.HeightProperty, 16.0);
+            border.SetValue(Border.CornerRadiusProperty, new CornerRadius(2));
+            border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+            border.SetValue(Border.BorderBrushProperty, Brush("#7B8493"));
+            border.SetValue(Border.BackgroundProperty, Brushes.Transparent);
+            var mark = new FrameworkElementFactory(typeof(TextBlock));
+            mark.Name = "Mark";
+            mark.SetValue(TextBlock.TextProperty, "✓");
+            mark.SetValue(TextBlock.ForegroundProperty, Brushes.White);
+            mark.SetValue(TextBlock.FontSizeProperty, 14.0);
+            mark.SetValue(TextBlock.FontWeightProperty, FontWeights.Bold);
+            mark.SetValue(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            mark.SetValue(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center);
+            mark.SetValue(UIElement.VisibilityProperty, Visibility.Collapsed);
+            border.AppendChild(mark);
+            var trigger = new Trigger { Property = CheckBox.IsCheckedProperty, Value = true };
+            trigger.Setters.Add(new Setter(Border.BackgroundProperty, Brush("#4F8EF7"), "Box"));
+            trigger.Setters.Add(new Setter(Border.BorderBrushProperty, Brush("#4F8EF7"), "Box"));
+            trigger.Setters.Add(new Setter(UIElement.VisibilityProperty, Visibility.Visible, "Mark"));
+            template.VisualTree = border;
+            template.Triggers.Add(trigger);
+            return template;
+        }
+
+        private void SetImageMode(CheckBox selected, CheckBox other)
+        {
+            if (updatingImageMode) return;
+            updatingImageMode = true;
+            other.IsChecked = false;
+            updatingImageMode = false;
+            UpdatePreview();
+        }
+
+        private static Button SmallRowButton(string text)
+        {
+            return new Button
+            {
+                Content = text,
+                Width = 58,
+                Height = 36,
+                Background = Brush("#050505"),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                FontSize = 13,
+                FontWeight = FontWeights.Bold,
+                Cursor = Cursors.Hand,
+                Template = ButtonTemplate(18),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+
+        private static string GuessSku(string folderName)
+        {
+            var match = Regex.Match(folderName, "[A-Za-z]+(?:-[A-Za-z]+)*-?\\d+(?:-\\d+)*");
+            return match.Success ? match.Value : folderName;
+        }
+
+        private static string DigitsOnly(string text)
+        {
+            var digits = new string((text ?? "").Where(char.IsDigit).ToArray());
+            return digits.Length == 0 ? "0" : digits.TrimStart('0').Length == 0 ? "0" : digits.TrimStart('0');
+        }
+
+        private static int ParseCount(string text)
+        {
+            int value;
+            return int.TryParse(DigitsOnly(text), out value) ? value : 0;
+        }
+    }
+}

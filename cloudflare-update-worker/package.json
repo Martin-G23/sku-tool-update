@@ -1,0 +1,14 @@
+{
+  "name": "sku-tool-update-worker",
+  "private": true,
+  "scripts": {
+    "dev": "cf dev",
+    "deploy": "cf deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "cloudflare": "latest",
+    "typescript": "latest",
+    "@cloudflare/workers-types": "latest"
+  }
+}

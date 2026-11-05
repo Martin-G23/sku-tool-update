@@ -1,0 +1,62 @@
+name: Build and publish SKU tool
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          if (-not $version) { $version = "manual-${{ github.run_number }}" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Compile personal edition
+        shell: cmd
+        run: >-
+          C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+          /target:winexe
+          /win32icon:outputs\SkuBatchUiPrototype\sku-source.ico
+          /out:sku-tool-personal.exe
+          /platform:x64
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationFramework.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Xaml.dll
+          /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll
+          outputs\SkuBatchUiPrototype\SkuBatchRenameUiPrototype.cs
+
+      - name: Compile share edition
+        shell: cmd
+        run: >-
+          C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+          /target:winexe
+          /win32icon:outputs\SkuBatchUiShareNoNameRecord\sku-source.ico
+          /out:sku-tool-share.exe
+          /platform:x64
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationFramework.dll
+          /reference:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Xaml.dll
+          /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll
+          outputs\SkuBatchUiShareNoNameRecord\SkuBatchRenameUiShareNoNameRecord.cs
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            sku-tool-personal.exe
+            sku-tool-share.exe
