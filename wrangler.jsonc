@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sku-tool-update",
+  "main": "cloudflare-update-worker/src/index.ts",
+  "compatibility_date": "2026-11-05",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "GITHUB_OWNER": "Martin-G23",
+    "GITHUB_REPO": "sku-tool-update"
+  }
+}
